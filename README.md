@@ -7,7 +7,7 @@ no browser tabs, no Electron, just a fast native window. It uses
 [streamlink](https://streamlink.github.io/) to resolve streams and serves them
 to mpv over a local HTTP pipe for **~2.5s end-to-end latency**.
 
-![screenshot placeholder](https://via.placeholder.com/800x450.png?text=omatv)
+![omatv in action](screenshot.png)
 
 ## Features
 
