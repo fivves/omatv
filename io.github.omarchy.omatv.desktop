@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=omatv
+GenericName=Twitch Viewer
+Comment=Watch Twitch streams with streamlink + mpv and embedded chat
+# Adjust this path to wherever you installed omatv
+Exec=/usr/local/bin/omatv
+Icon=io.github.omarchy.omatv
+Categories=Network;AudioVideo;Video;
+Keywords=twitch;stream;chat;streamlink;
+Terminal=false
+StartupWMClass=io.github.omarchy.omatv

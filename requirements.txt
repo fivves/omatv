@@ -1,0 +1,6 @@
+# omatv dependencies (system packages, not pip — see README)
+# Arch:   sudo pacman -S python-mpv python-gobject webkitgtk-6.0 libadwaita mpv streamlink
+# Debian: sudo apt install python3-mpv python3-gi gir1.2-adw-1 gir1.2-webkit-6.0 mpv streamlink
+
+python-mpv>=1.0
+PyGObject>=3.46
