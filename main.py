@@ -77,6 +77,14 @@ APP_CSS = b"""
   min-height: 18px;
   margin-top: 1px;
 }
+.mute-badge {
+  background: rgba(239, 68, 68, 0.92);
+  color: white;
+  border-radius: 9999px;
+  padding: 6px 12px;
+  font-weight: 700;
+  font-size: 12px;
+}
 """
 
 
@@ -406,6 +414,13 @@ class VideoArea(Gtk.GLArea):
             opengl_init_params={"get_proc_address": self._proc_fn},
         )
         self.render_ctx.update_cb = lambda: idle(self.queue_render)
+
+        # Keep the persistent mute badge in sync with mpv's real mute state
+        # (covers click-toggle, and any future mute source).
+        self.player.observe_property(
+            "mute", lambda _name, val: idle(self.app.on_mute_changed, bool(val))
+        )
+
         if self._pending_url:
             url = self._pending_url
             self._pending_url = None
@@ -450,6 +465,15 @@ class VideoArea(Gtk.GLArea):
     def set_volume(self, v):
         if self.player:
             self.player.volume = max(0, min(130, v))
+
+    def toggle_mute(self):
+        if not self.player:
+            return False
+        self.player.mute = not self.player.mute
+        return True
+
+    def is_muted(self):
+        return bool(self.player and self.player.mute)
 
     def on_unrealize(self, *a):
         if self.render_ctx:
@@ -597,6 +621,17 @@ class OmatvWindow(Adw.ApplicationWindow):
         status_pill.append(self.status_label)
         self.status_revealer.set_child(status_pill)
         video_overlay.add_overlay(self.status_revealer)
+
+        # Persistent mute badge — stays visible in the top-right while muted.
+        self.mute_badge = Gtk.Label(label="🔇 Muted")
+        self.mute_badge.add_css_class("mute-badge")
+        self.mute_badge.set_halign(Gtk.Align.END)
+        self.mute_badge.set_valign(Gtk.Align.START)
+        self.mute_badge.set_margin_top(14)
+        self.mute_badge.set_margin_end(14)
+        self.mute_badge.set_visible(False)
+        video_overlay.add_overlay(self.mute_badge)
+
         video_overlay.set_hexpand(True)
         video_overlay.set_vexpand(True)
 
@@ -983,7 +1018,11 @@ class OmatvWindow(Adw.ApplicationWindow):
 
     def on_video_click(self, gesture, n, x, y):
         b = gesture.get_current_button()
-        if b == 1 and n >= 2:
+        # Single left click toggles mute; double-click (n=2) still fullscreens.
+        if b == 1 and n == 1:
+            # Mute toggle — the persistent badge (top-right) reflects state.
+            self.video.toggle_mute()
+        elif b == 1 and n >= 2:
             self.toggle_fullscreen()
         elif b == 8:
             self.toggle_fullscreen()
@@ -993,6 +1032,13 @@ class OmatvWindow(Adw.ApplicationWindow):
             self.unfullscreen()
         else:
             self.fullscreen()
+
+    def on_mute_changed(self, muted):
+        """Show/hide the persistent mute badge from mpv's real mute state."""
+        self.mute_badge.set_visible(bool(muted) and self.video.player is not None)
+
+    def hide_mute_badge(self):
+        self.mute_badge.set_visible(False)
 
     def flash_status(self, text, transient=False):
         self.status_label.set_text(text)
@@ -1174,6 +1220,7 @@ class OmatvWindow(Adw.ApplicationWindow):
                     self.kill_streamlink()
                     self.video_stack.set_visible_child_name("placeholder")
                     self.hide_status()
+                    self.hide_mute_badge()
                     self.update_header("omatv", "", "")
                     self.show_toast(f"Could not open {name or login}: {err or 'stream unavailable'}", timeout=6)
                 return False
@@ -1199,6 +1246,7 @@ class OmatvWindow(Adw.ApplicationWindow):
             self.video_stack.set_visible_child_name("placeholder")
             self.current_channel = None
             self.current_display_name = None
+            self.hide_mute_badge()
             self.update_header("omatv", "", "")
             self.push_js({"type": "stream_start", "started_at": "", "viewers": 0})
         return False
