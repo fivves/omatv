@@ -3,6 +3,7 @@
 const $ = (id) => document.getElementById(id);
 const msgsEl = $("msgs");
 const chanNameEl = $("chan-name");
+const viewersEl = $("viewers");
 const connEl = $("conn");
 const noticeEl = $("notice");
 const input = $("msg-input");
@@ -60,11 +61,20 @@ window.__push = function (payload) {
       break;
     case "channel":
       clearUptime();
+      clearViewers();
       joinChannel(payload);
       break;
     case "stream_start":
-      if (payload?.started_at) setUptime(payload.started_at);
-      else clearUptime();
+      if (payload?.started_at) {
+        setUptime(payload.started_at);
+        if (payload?.viewers != null) setViewers(payload.viewers);
+      } else {
+        clearUptime();
+        clearViewers();
+      }
+      break;
+    case "viewer_count":
+      if (payload?.viewers != null) setViewers(payload.viewers);
       break;
   }
 };
@@ -782,6 +792,25 @@ function clearUptime() {
   if (state.uptimeTimer) clearInterval(state.uptimeTimer);
   state.uptimeTimer = null;
   state.startedAt = null;
+}
+
+// ---- viewers pill (center of the header, live only) ----
+function formatViewers(n) {
+  if (n == null) return "";
+  return n.toLocaleString("en-US");
+}
+function setViewers(n) {
+  const text = formatViewers(n) + " watching";
+  if (viewersEl.textContent !== text) {
+    viewersEl.textContent = text;
+    viewersEl.classList.add("live-viewers");
+    viewersEl.classList.remove("hidden");
+  }
+}
+function clearViewers() {
+  viewersEl.textContent = "";
+  viewersEl.classList.remove("live-viewers");
+  viewersEl.classList.add("hidden");
 }
 
 function updateComposer() {

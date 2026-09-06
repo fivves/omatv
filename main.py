@@ -1056,6 +1056,11 @@ class OmatvWindow(Adw.ApplicationWindow):
                 GLib.idle_add(
                     self.update_header, display, info.get("title", ""), info.get("game", "")
                 )
+                # Keep the chat header viewer count fresh while playing.
+                GLib.idle_add(
+                    self.push_js,
+                    {"type": "viewer_count", "viewers": info.get("viewers", 0)},
+                )
 
         threading.Thread(target=work, daemon=True).start()
         return True
@@ -1151,12 +1156,14 @@ class OmatvWindow(Adw.ApplicationWindow):
                                 info.get("title", ""),
                                 info.get("game", ""),
                             )
-                            # Tell chat the stream start time for the uptime pill.
+                            # Tell chat the stream start time for the uptime pill
+                            # plus viewer count for the header.
                             GLib.idle_add(
                                 self.push_js,
                                 {
                                     "type": "stream_start",
                                     "started_at": info.get("started_at", ""),
+                                    "viewers": info.get("viewers", 0),
                                 },
                             )
                         else:
@@ -1193,7 +1200,7 @@ class OmatvWindow(Adw.ApplicationWindow):
             self.current_channel = None
             self.current_display_name = None
             self.update_header("omatv", "", "")
-            self.push_js({"type": "stream_start", "started_at": ""})
+            self.push_js({"type": "stream_start", "started_at": "", "viewers": 0})
         return False
 
     def show_login_dialog(self):

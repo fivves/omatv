@@ -29,9 +29,9 @@ body {
 }
 
 #head {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
-  justify-content: space-between;
   padding: 10px 14px;
   background: var(--panel);
   border-bottom: 1px solid rgba(255,255,255,.06);
@@ -43,6 +43,8 @@ body {
   align-items: center;
   gap: 8px;
   min-width: 0;
+  justify-self: start;
+  grid-column: 1;
 }
 
 #chan-name {
@@ -68,6 +70,8 @@ body {
   font-size: 11px;
   color: var(--muted);
   flex-shrink: 0;
+  justify-self: end;
+  grid-column: 3;
 }
 .conn.connected {
   color: var(--green);
@@ -77,6 +81,24 @@ body {
 }
 .conn.error { color: var(--red); }
 .conn.readonly { color: #fbbf24; }
+
+/* Viewers count pill, centered in the header between name + conn */
+#viewers {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border-radius: 9999px;
+  padding: 2px 10px;
+  flex-shrink: 0;
+  white-space: nowrap;
+  margin: 0 6px;
+  grid-column: 2;
+  justify-self: center;
+}
+#viewers.live-viewers {
+  color: var(--accent);
+}
 
 #msgs {
   flex: 1;
