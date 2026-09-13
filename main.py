@@ -26,6 +26,10 @@ CACHE = os.path.expanduser("~/.cache/omatv")
 AVATAR_DIR = os.path.join(CACHE, "avatars")
 SETTINGS_PATH = os.path.expanduser("~/.config/omatv/settings.json")
 DEFAULT_CHAT_WIDTH = 340
+# Deferral for the single-click mute so the first half of a double-click
+# doesn't mute before the fullscreen. Keep this short for a snappy mute;
+# double-clicks slower than this will mute first.
+SINGLE_CLICK_DELAY_MS = 200
 CONFIG_CANDIDATES = [
     os.environ.get("OMATV_TWITCH_JSON", ""),
     os.path.expanduser("~/.config/twitch.json"),
@@ -641,6 +645,7 @@ class OmatvWindow(Adw.ApplicationWindow):
         scroll.connect("scroll", self.on_video_scroll)
         video_overlay.add_controller(scroll)
 
+        self._click_timer = None
         click = Gtk.GestureClick(button=0)
         click.connect("released", self.on_video_click)
         video_overlay.add_controller(click)
@@ -1018,14 +1023,35 @@ class OmatvWindow(Adw.ApplicationWindow):
 
     def on_video_click(self, gesture, n, x, y):
         b = gesture.get_current_button()
-        # Single left click toggles mute; double-click (n=2) still fullscreens.
+        # GTK emits ::released for every click, so toggling mute straight away
+        # here also fires on the first half of a double-click. Defer the mute
+        # by the double-click window; a second click cancels it, so a
+        # double-click fullscreens without muting.
         if b == 1 and n == 1:
-            # Mute toggle — the persistent badge (top-right) reflects state.
-            self.video.toggle_mute()
-        elif b == 1 and n >= 2:
+            self._cancel_click_timer()
+            self._click_timer = GLib.timeout_add(
+                SINGLE_CLICK_DELAY_MS, self._single_click_mute
+            )
+        elif b == 1 and n == 2:
+            # Exactly the 2nd press of a group: n=3+ would toggle straight
+            # back out of fullscreen.
+            self._cancel_click_timer()
             self.toggle_fullscreen()
         elif b == 8:
+            self._cancel_click_timer()
             self.toggle_fullscreen()
+
+    def _cancel_click_timer(self):
+        if self._click_timer:
+            GLib.source_remove(self._click_timer)
+            self._click_timer = None
+
+    def _single_click_mute(self):
+        """One-shot: a click that no second click followed. The persistent
+        badge (top-right) reflects mpv's mute state."""
+        self._click_timer = None
+        self.video.toggle_mute()
+        return False
 
     def toggle_fullscreen(self):
         if self.is_fullscreen():
