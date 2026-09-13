@@ -748,6 +748,65 @@ const SEND_WINDOW = 30000;
 const SEND_MAX = 18;
 let sentTimes = [];
 
+// ---- send history (Up/Down recall, Discord-style) ----
+// Only sent messages land here (not drafts). Bounded so the list can't
+// grow forever in a long session.
+const SEND_HISTORY_MAX = 100;
+let sendHistory = [];
+let historyIndex = -1; // -1 = not browsing history (fresh draft)
+let historyDraft = ""; // preserves what you were typing when you pressed Up
+
+function recallOlder() {
+  if (!sendHistory.length) return false;
+  if (historyIndex === -1) {
+    historyDraft = getEditorText();
+    historyIndex = sendHistory.length - 1;
+  } else if (historyIndex > 0) {
+    historyIndex--;
+  } else {
+    return false; // already at the oldest
+  }
+  setEditorContent(sendHistory[historyIndex]);
+  return true;
+}
+
+function recallNewer() {
+  if (historyIndex === -1) return false;
+  if (historyIndex < sendHistory.length - 1) {
+    historyIndex++;
+    setEditorContent(sendHistory[historyIndex]);
+  } else {
+    // past the newest entry — restore the draft you had before recalling
+    historyIndex = -1;
+    setEditorContent(historyDraft);
+  }
+  return true;
+}
+
+function pushSendHistory(text) {
+  // Don't stack consecutive duplicates — pressing Up once after spamming
+  // the same line should land on it, not on an identical older copy.
+  if (sendHistory[sendHistory.length - 1] !== text) {
+    sendHistory.push(text);
+    if (sendHistory.length > SEND_HISTORY_MAX) sendHistory.shift();
+  }
+  historyIndex = -1;
+  historyDraft = "";
+}
+
+function setEditorContent(text) {
+  input.innerHTML = "";
+  input.append(document.createTextNode(text));
+  renderEmotesInEditor();
+  const r = document.createRange();
+  r.selectNodeContents(input);
+  r.collapse(false);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(r);
+  input.focus();
+}
+
 function updateConnUI() {
   if (!state.connected && state.wantedChannel) {
     setConn("connecting…", "connecting");
@@ -847,6 +906,7 @@ $("composer").addEventListener("submit", (ev) => {
     return;
   }
   sentTimes.push(now);
+  pushSendHistory(text);
 
   state.ws.send(`PRIVMSG #${state.joinedChannel.login} :${text.slice(0, 480)}`);
 
@@ -896,6 +956,31 @@ input.addEventListener("keydown", (ev) => {
   if (ev.key === "Enter" && !ev.shiftKey && !tabState) {
     ev.preventDefault();
     $("composer").requestSubmit();
+    return;
+  }
+  // Up/Down recall of sent messages (Discord-style). Only when no tab
+  // completion popup is active and the caret is at the start of an empty
+  // box (or we're already browsing history). stopImmediatePropagation keeps
+  // the later tab-completion listener from also reacting to the key.
+  if ((ev.key === "ArrowUp" || ev.key === "ArrowDown") && !tabState) {
+    const empty = !getEditorText();
+    if (ev.key === "ArrowUp") {
+      // Recall when the box is empty, or when we're already walking history
+      // (recalled text sits in the box with the caret at the end).
+      if (empty || historyIndex !== -1) {
+        if (recallOlder()) {
+          ev.preventDefault();
+          ev.stopImmediatePropagation();
+          return;
+        }
+      }
+    } else if (ev.key === "ArrowDown" && historyIndex !== -1) {
+      if (recallNewer()) {
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        return;
+      }
+    }
   }
 });
 
@@ -1323,6 +1408,12 @@ input.addEventListener("keydown", (ev) => {
 });
 
 input.addEventListener("input", () => {
+  // Any real keystroke while browsing send-history exits history mode:
+  // the recalled text becomes the new draft (mirrors Discord).
+  if (historyIndex !== -1) {
+    historyIndex = -1;
+    historyDraft = "";
+  }
   // Auto-open @-mention completion while typing (Discord-style) — no Tab needed.
   const wb = getWordBeforeCursor();
   if (wb && wb.word.startsWith("@")) {
