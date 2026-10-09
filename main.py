@@ -17,6 +17,7 @@ gi.require_version("Adw", "1")
 gi.require_version("WebKit", "6.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango, WebKit
 
+import home
 import mpv
 
 APP_ID = "io.github.omarchy.omatv"
@@ -343,9 +344,13 @@ class StreamerButton(Gtk.Button):
 
 
 class VideoArea(Gtk.GLArea):
-    def __init__(self, app):
+    def __init__(self, app, tile=False):
         super().__init__()
         self.app = app
+        # tile=True: a secondary muted player whose END_FILE / mute callbacks
+        # must stay inert (they'd otherwise drive the window's one-player
+        # channel-switch and mute-badge behaviour).
+        self.tile = tile
         self.player = None
         self.render_ctx = None
         self._proc_fn = None
@@ -404,13 +409,16 @@ class VideoArea(Gtk.GLArea):
             # because there's zero cushion; -2 keeps one segment of slack to
             # fetch ahead while staying near the edge.
             demuxer_lavf_o="live_start_index=-2",
+            # A tile never makes sound: muted from construction.
+            **({"mute": True} if self.tile else {}),
         )
 
         @self.player.event_callback(mpv.MpvEventID.END_FILE)
         def on_end(event):
             reason = getattr(event.data, "reason", None) if event.data else None
             reason_name = getattr(reason, "name", None) if reason is not None else None
-            idle(self.app.on_playback_ended, reason_name)
+            if not self.tile:
+                idle(self.app.on_playback_ended, reason_name)
 
         self.render_ctx = mpv.MpvRenderContext(
             self.player,
@@ -419,11 +427,11 @@ class VideoArea(Gtk.GLArea):
         )
         self.render_ctx.update_cb = lambda: idle(self.queue_render)
 
-        # Keep the persistent mute badge in sync with mpv's real mute state
-        # (covers click-toggle, and any future mute source).
-        self.player.observe_property(
-            "mute", lambda _name, val: idle(self.app.on_mute_changed, bool(val))
-        )
+        # Mute badge follows mpv's real mute state; tiles never touch it.
+        if not self.tile:
+            self.player.observe_property(
+                "mute", lambda _name, val: idle(self.app.on_mute_changed, bool(val))
+            )
 
         if self._pending_url:
             url = self._pending_url
@@ -594,9 +602,16 @@ class OmatvWindow(Adw.ApplicationWindow):
         self.rail.set_halign(Gtk.Align.CENTER)
         rail_scroll.set_child(self.rail)
 
+        # Home button pinned left of the scrollable channel rail.
+        rail_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.home_btn = home.make_home_button(self)
+        rail_bar.append(self.home_btn)
+        rail_scroll.set_hexpand(True)
+        rail_bar.append(rail_scroll)
+
         toolbar = Adw.ToolbarView()
         toolbar.add_top_bar(header)
-        toolbar.add_top_bar(rail_scroll)
+        toolbar.add_top_bar(rail_bar)
 
         self.video_stack = Gtk.Stack()
         placeholder = Adw.StatusPage(
@@ -710,9 +725,17 @@ class OmatvWindow(Adw.ApplicationWindow):
         self._btn_gesture.connect("released", on_drag_end)
         paned.add_controller(self._btn_gesture)
 
+        # Content stack: home (full width) slides to the watch page. home is
+        # first, so the app opens on home.
         content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         content.append(paned)
-        self.toast_overlay.set_child(content)
+        self.home_page = home.HomePage(self, VideoArea)
+        self.content_stack = Gtk.Stack()
+        self.content_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.content_stack.set_transition_duration(250)
+        self.content_stack.add_named(self.home_page, "home")
+        self.content_stack.add_named(content, "watch")
+        self.toast_overlay.set_child(self.content_stack)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         root.append(toolbar)
@@ -1537,8 +1560,8 @@ class OmatvWindow(Adw.ApplicationWindow):
                 btn = StreamerButton(info)
                 btn.connect(
                     "clicked",
-                    lambda b: self.play_channel(
-                        b.info["login"], b.info["name"], b.info["id"]
+                    lambda b: home.open_channel(
+                        self, b.info["login"], b.info["name"], b.info["id"]
                     ),
                 )
                 self.rail.append(btn)
@@ -1553,6 +1576,9 @@ class OmatvWindow(Adw.ApplicationWindow):
                     btn.set_avatar_texture(tex)
                 except Exception:
                     pass
+
+        # Drive the home grid from the same 60s follows refresh.
+        self.home_page.update(infos)
 
     def start_loops(self):
         def loop():
