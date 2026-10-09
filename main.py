@@ -781,6 +781,10 @@ class OmatvWindow(Adw.ApplicationWindow):
             enable_write_console_messages_to_stdout=True,
         )
         wv = WebKit.WebView(settings=settings, user_content_manager=manager)
+        # The chat page owns right-click: it shows its own reply/copy menu.
+        # Returning True marks the event handled so WebKit doesn't also pop
+        # its default "Back / Reload / Inspect Element" menu on top of it.
+        wv.connect("context-menu", lambda view, ctx, event: True)
         bg = Gdk.RGBA()
         bg.parse("#131317")
         wv.set_background_color(bg)

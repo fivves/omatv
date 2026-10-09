@@ -13,6 +13,10 @@ const emotePop = $("emote-pop");
 const emoteGrid = $("emote-grid");
 const emoteSearch = $("emote-search");
 const resumeBtn = $("resume");
+const ctxMenu = $("ctx-menu");
+const replyBar = $("reply-bar");
+const replyText = replyBar.querySelector(".reply-text");
+const replyCancel = $("reply-cancel");
 
 let state = {
   token: null,
@@ -35,6 +39,7 @@ let state = {
   knownUsers: new Map(),  // login(lower) -> {login, display, color}
   stick: true,
   reconnectTimer: null,
+  reply: null, // {id, login, display, body} while composing a reply
 };
 
 function bridge(msg) {
@@ -600,6 +605,32 @@ function addMessage(nick, tags, rawText) {
   const row = document.createElement("div");
   row.className = "msg";
   row.dataset.login = (tags.login || nick).toLowerCase();
+  row.dataset.display = tags["display-name"] || nick;
+  // Message UUID — the reply-parent-msg-id we send back when replying to it.
+  row.dataset.msgId = tags.id || "";
+  // Plain-text body, used as the quote preview in the reply bar / context menu.
+  row.dataset.body = text;
+
+  // A message that is itself a reply carries the parent's author + body in
+  // its tags. Render that as a quoted line above the message (matching the
+  // Twitch web client). The body is IRC-escaped, so unescape it.
+  if (tags["reply-parent-msg-id"]) {
+    const ctx = document.createElement("div");
+    ctx.className = "reply-ctx";
+    const who = document.createElement("b");
+    who.textContent =
+      "@" +
+      (tags["reply-parent-display-name"] ||
+        tags["reply-parent-user-login"] ||
+        "unknown");
+    ctx.append(
+      who,
+      document.createTextNode(
+        " " + unescapeTags(tags["reply-parent-msg-body"] || "")
+      )
+    );
+    row.append(ctx);
+  }
 
   if (tags["msg-id"] === "highlighted-message") row.classList.add("highlighted");
   if (tags["first-msg"] === "1") row.classList.add("first");
@@ -741,6 +772,126 @@ msgsEl.addEventListener("scroll", () => {
   }
 });
 resumeBtn.addEventListener("click", scrollToBottom);
+
+/* -------------------- replying to a message (right-click) -------------- */
+
+let ctxRow = null;
+
+function closeCtxMenu() {
+  ctxMenu.classList.add("hidden");
+  ctxMenu.innerHTML = "";
+  ctxRow = null;
+}
+
+function ctxItem(label, onClick) {
+  const el = document.createElement("div");
+  el.className = "ctx-item";
+  el.textContent = label;
+  if (onClick) el.addEventListener("click", onClick);
+  return el;
+}
+
+function copyMsgText(text) {
+  if (!text) return;
+  // document.execCommand rather than navigator.clipboard: the chat page is a
+  // file:// document, which is not a secure context, so the async Clipboard
+  // API is unavailable there.
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.top = "-1000px";
+  ta.style.opacity = "0";
+  document.body.append(ta);
+  ta.select();
+  try {
+    document.execCommand("copy");
+  } catch (e) {}
+  ta.remove();
+}
+
+function openCtxMenu(x, y, row) {
+  ctxRow = row;
+  ctxMenu.innerHTML = "";
+  // Our own message has no UUID (Twitch never echoes it), so there is nothing
+  // to reply TO — only offer Copy there.
+  if (row.dataset.msgId) {
+    ctxMenu.append(
+      ctxItem("Reply", () => {
+        startReply(row);
+        closeCtxMenu();
+      })
+    );
+    const sep = document.createElement("div");
+    sep.className = "ctx-sep";
+    ctxMenu.append(sep);
+  }
+  ctxMenu.append(
+    ctxItem("Copy message", () => {
+      copyMsgText(row.dataset.body || "");
+      closeCtxMenu();
+    })
+  );
+
+  // Show off-screen, measure, then clamp inside the viewport.
+  ctxMenu.classList.remove("hidden");
+  ctxMenu.style.left = "0px";
+  ctxMenu.style.top = "0px";
+  const r = ctxMenu.getBoundingClientRect();
+  ctxMenu.style.left = Math.max(4, Math.min(x, window.innerWidth - r.width - 4)) + "px";
+  ctxMenu.style.top = Math.max(4, Math.min(y, window.innerHeight - r.height - 4)) + "px";
+}
+
+function startReply(row) {
+  const display = row.dataset.display || row.dataset.login || "";
+  const body = (row.dataset.body || "").replace(/\s+/g, " ").trim();
+  state.reply = {
+    id: row.dataset.msgId,
+    login: row.dataset.login || display.toLowerCase(),
+    display,
+    body,
+  };
+  replyText.innerHTML = "";
+  const who = document.createElement("b");
+  who.textContent = "Replying to @" + display;
+  replyText.append(
+    who,
+    document.createTextNode(body ? ": " + body.slice(0, 90) : "")
+  );
+  replyBar.classList.remove("hidden");
+  input.focus();
+}
+
+function cancelReply() {
+  state.reply = null;
+  replyBar.classList.add("hidden");
+  replyText.innerHTML = "";
+}
+
+replyCancel.addEventListener("click", cancelReply);
+
+msgsEl.addEventListener("contextmenu", (ev) => {
+  const row = ev.target instanceof Element ? ev.target.closest(".msg") : null;
+  if (!row || row.classList.contains("system-msg")) {
+    closeCtxMenu();
+    return; // outside a real message — leave WebKit's default menu alone
+  }
+  ev.preventDefault();
+  openCtxMenu(ev.clientX, ev.clientY, row);
+});
+
+msgsEl.addEventListener("scroll", closeCtxMenu);
+window.addEventListener("blur", closeCtxMenu);
+
+document.addEventListener("keydown", (ev) => {
+  if (ev.key !== "Escape") return;
+  if (ctxRow) {
+    closeCtxMenu();
+  } else if (state.reply) {
+    cancelReply();
+    input.focus();
+  }
+});
 
 /* ------------------------------ composer ----------------------------- */
 
@@ -908,10 +1059,33 @@ $("composer").addEventListener("submit", (ev) => {
   sentTimes.push(now);
   pushSendHistory(text);
 
-  state.ws.send(`PRIVMSG #${state.joinedChannel.login} :${text.slice(0, 480)}`);
+  const reply = state.reply;
+  const body = text.slice(0, 480);
+  if (reply && reply.id) {
+    // IRCv3 client tag: must precede the command. Twitch renders the message
+    // as a reply to that UUID in every client.
+    state.ws.send(
+      `@reply-parent-msg-id=${reply.id} PRIVMSG #${state.joinedChannel.login} :${body}`
+    );
+  } else {
+    state.ws.send(`PRIVMSG #${state.joinedChannel.login} :${body}`);
+  }
 
   const mine = document.createElement("div");
   mine.className = "msg own-msg";
+  mine.dataset.login = (state.nick || "").toLowerCase();
+  mine.dataset.display = state.nick || "";
+  mine.dataset.body = text;
+  // Our own PRIVMSG is never echoed back, so the quoted parent line has to be
+  // drawn here from what we captured when the reply was started.
+  if (reply) {
+    const rc = document.createElement("div");
+    rc.className = "reply-ctx";
+    const rb = document.createElement("b");
+    rb.textContent = "@" + reply.display;
+    rc.append(rb, document.createTextNode(" " + (reply.body || "")));
+    mine.append(rc);
+  }
   // Render OUR badges (captured from USERSTATE) on the optimistic copy —
   // Twitch doesn't echo our own PRIVMSG back, so this is the only place they
   // can appear.
@@ -947,6 +1121,7 @@ $("composer").addEventListener("submit", (ev) => {
   bodySpan.append(frag);
   mine.append(bodySpan);
   appendMsg(mine);
+  if (reply) cancelReply();
 
   input.innerHTML = "";
   input.focus();
@@ -990,6 +1165,9 @@ document.addEventListener("click", (ev) => {
   }
   if (!tabPop.contains(ev.target)) {
     closeTabPop();
+  }
+  if (!ctxMenu.contains(ev.target)) {
+    closeCtxMenu();
   }
 });
 
@@ -1433,6 +1611,8 @@ input.addEventListener("input", () => {
 
 async function joinChannel(info) {
   state.wantedChannel = info;
+  // A pending reply belongs to the channel we're leaving.
+  cancelReply();
   chanNameEl.textContent = info.name || info.login;
   msgsEl.innerHTML = "";
   _pendingMsgs = [];

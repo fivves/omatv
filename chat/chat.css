@@ -442,3 +442,78 @@ a.link:hover { text-decoration: underline; }
 }
 .emote-cell:hover { background: rgba(169,112,255,.2); }
 .emote-cell img { height: 28px; max-width: 48px; object-fit: contain; }
+
+/* ---------------------- reply: bar, quote, menu ---------------------- */
+
+/* "Replying to @user" strip above the composer */
+#reply-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  background: var(--panel-2);
+  border: 1px solid rgba(255,255,255,.08);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+#reply-bar .reply-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#reply-bar .reply-text b { color: var(--accent); font-weight: 600; }
+#reply-cancel {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 6px;
+}
+#reply-cancel:hover { background: rgba(255,255,255,.08); color: var(--text); }
+
+/* Quoted parent shown above a message that is itself a reply */
+.msg .reply-ctx {
+  display: block;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--muted);
+  margin-bottom: 1px;
+  padding-left: 6px;
+  border-left: 2px solid rgba(169,112,255,.55);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.msg .reply-ctx b { color: #c9a6ff; font-weight: 600; }
+
+/* Right-click menu */
+#ctx-menu {
+  position: fixed;
+  z-index: 50;
+  min-width: 158px;
+  padding: 4px;
+  background: var(--panel-2);
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0,0,0,.55);
+}
+#ctx-menu .ctx-item {
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text);
+  white-space: nowrap;
+}
+#ctx-menu .ctx-item:hover { background: rgba(169,112,255,.2); }
+#ctx-menu .ctx-item.disabled { color: var(--muted); opacity: .5; cursor: default; }
+#ctx-menu .ctx-item.disabled:hover { background: none; }
+#ctx-menu .ctx-sep { height: 1px; background: rgba(255,255,255,.08); margin: 4px 6px; }
