@@ -2,15 +2,20 @@
 
 A native GTK4 Twitch viewer with embedded chat, built for Linux (Wayland/X11).
 
-omatv pairs a full-screen mpv video surface with a WebKit-based chat pane —
-no browser tabs, no Electron, just a fast native window. It uses
-[streamlink](https://streamlink.github.io/) to resolve streams and serves them
-to mpv over a local HTTP pipe for **~2.5s end-to-end latency**.
+omatv opens on a grid of everyone you follow who is live, each tile a real
+muted player, and clicking one grows it into a full mpv video surface with a
+WebKit-based chat pane beside it — no browser tabs, no Electron, just a fast
+native window. It uses [streamlink](https://streamlink.github.io/) to resolve
+streams and serves them to mpv over a local HTTP pipe for **~2.5s end-to-end
+latency**.
 
 ![omatv in action](screenshot.png)
 
 ## Features
 
+- **Home grid** — every followed channel that's live, as a grid of real muted
+  160p players. Clicking a tile moves that already-running player into the
+  watch view, so there is no second player and no reload when you switch.
 - **Low-latency playback** — streamlink `--player-external-http` re-serves the
   stream as a continuous localhost stream; mpv plays right at the live edge
   (~2.5s, same as the CLI).
@@ -19,6 +24,8 @@ to mpv over a local HTTP pipe for **~2.5s end-to-end latency**.
   (global + per-channel + your own sub emotes anywhere).
 - **Real badges** — actual Twitch badge images (subscriber, VIP, mod,
   broadcaster, bits, …) from the Helix badges API, with text fallbacks.
+- **Native replies** — right-click a message to reply in-thread or copy it;
+  quoted parents render inline.
 - **Follows rail** — clickable avatars of everyone you follow, live/offline
   state, viewer count, game, and title on hover.
 - **Tab completion** — `@name` user mentions and emote completion while typing.
@@ -79,8 +86,12 @@ omatv                              # open the app
 omatv <channel>                    # open and immediately play a channel
 ```
 
-Click a streamer in the follows rail to watch. Use the chat pane to talk;
-`@` opens user mention completion, Tab completes emotes.
+omatv opens on the home grid: everyone you follow who is live right now, each
+tile already playing (muted). Click a tile, or a streamer in the follows rail,
+to watch — that tile becomes the full player, so switching channels does not
+restart a stream. Use the chat pane to talk; `@` opens user mention
+completion, Tab completes emotes, and right-clicking a message offers Reply or
+Copy message. The house button at the top of the rail returns to the grid.
 
 ## How it works
 
@@ -96,6 +107,11 @@ Twitch IRC (WebSocket) ──► WebKit webview (chat/chat.js)
 - **Streams:** streamlink resolves + downloads the HLS, then re-serves it as a
   continuous local HTTP stream. mpv reads it like a live pipe — no HLS segment
   anchoring, so playback starts at the live edge instead of 3 segments back.
+- **Grid and watch view share one surface:** the tiles and the grown player
+  live on a single `Gtk.Fixed` inside a scroller, so selecting a channel moves
+  the running player rather than creating a second one. Tiles software-decode
+  and mute at construction; a grid of hardware-decoding players can crash
+  inside ffmpeg's Vulkan probe.
 - **Chat:** a WebKit webview loads `chat/chat.html` + `chat.js`, which connect
   directly to Twitch IRC over WebSocket. A Python bridge (`window.webkit.
   messageHandlers.omatv.postMessage`) handles fetches that need the OAuth
@@ -111,6 +127,7 @@ Twitch IRC (WebSocket) ──► WebKit webview (chat/chat.js)
 ```
 omatv/
 ├── main.py            # GTK4 window, mpv surface, Python bridge
+├── home.py            # live-tile grid, responsive layout, animations
 ├── chat/
 │   ├── chat.html      # chat UI shell
 │   ├── chat.js        # IRC client, emote/badge rendering, composer
@@ -126,6 +143,8 @@ omatv/
 - **Stream won't start** — make sure `streamlink` and `mpv` are installed and
   on your `PATH`. Streams resolve via streamlink; if the channel is offline or
   region-blocked, playback won't start.
+- **Tiles are black** — a tile only has a picture once its stream resolves;
+  give it a beat, and check that the channel is still live.
 - **Chat shows "Read-only"** — your token lacks `chat:edit`. Generate a new
   token with that scope and sign in again.
 - **No follows rail** — your token lacks `user:read:follows`.
