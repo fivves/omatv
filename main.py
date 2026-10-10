@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import ctypes
+import hashlib
 import json
 import os
 import subprocess
@@ -31,6 +32,22 @@ DEFAULT_CHAT_WIDTH = 340
 # doesn't mute before the fullscreen. Keep this short for a snappy mute;
 # double-clicks slower than this will mute first.
 SINGLE_CLICK_DELAY_MS = 200
+
+# Every stream is loaded at SOURCE quality once; there is no quality switching
+# anywhere. See home.STREAM_QUALITY.
+#
+# hwdec for tile players. auto-safe is forbidden on this hardware: ffmpeg's
+# Vulkan hwaccel probe (auto-safe) segfaults. An explicit vaapi request does
+# not enumerate Vulkan, so it is the candidate; the shipped value is whatever
+# the 60s source-quality multi-tile run proved stable, else "no".
+TILE_HWDEC = os.environ.get("OMATV_TILE_HWDEC", "vaapi")
+
+# Responsive layout budget. The chat is an OVERLAY, so it never contributes to
+# the content's minimum width; when the window cannot fit it and a minimum
+# video pane it collapses to a toggleable pane that slides in from the right.
+CHAT_MIN_W = 320          # WebKitWebView measure minimum (hard floor)
+VIDEO_MIN_W = 360         # never shrink the watch video below this
+CHAT_COLLAPSE_W = CHAT_MIN_W + VIDEO_MIN_W + 24   # below this the chat auto-collapses
 CONFIG_CANDIDATES = [
     os.environ.get("OMATV_TWITCH_JSON", ""),
     os.path.expanduser("~/.config/twitch.json"),
@@ -90,6 +107,10 @@ APP_CSS = b"""
   font-weight: 700;
   font-size: 12px;
 }
+.chat-handle {
+  background: rgba(255, 255, 255, 0.06);
+}
+.chat-handle:hover { background: rgba(255, 255, 255, 0.16); }
 """
 
 
@@ -311,8 +332,17 @@ class StreamerButton(Gtk.Button):
         self.live_dot.set_halign(Gtk.Align.END)
         self.live_dot.set_margin_bottom(2)
         self.live_dot.set_margin_end(2)
-        self.live_dot.set_visible(False)
-        overlay.add_overlay(self.live_dot)
+        # A live dot fades in/out rather than popping when a stream starts or
+        # stops (same 300ms motion as everything else).
+        self.live_dot_rev = Gtk.Revealer(
+            transition_type=Gtk.RevealerTransitionType.CROSSFADE,
+            transition_duration=home.MOTION_MS,
+            child=self.live_dot,
+            reveal_child=False,
+        )
+        self.live_dot_rev.set_valign(Gtk.Align.END)
+        self.live_dot_rev.set_halign(Gtk.Align.END)
+        overlay.add_overlay(self.live_dot_rev)
 
         self.set_child(overlay)
         self._apply_live(False)
@@ -330,7 +360,8 @@ class StreamerButton(Gtk.Button):
     def set_state(self, live, game):
         self.info["live"] = live
         self.info["game"] = game
-        self.live_dot.set_visible(live)
+        if self.live_dot_rev.get_reveal_child() != bool(live):
+            self.live_dot_rev.set_reveal_child(bool(live))
         self._apply_live(live)
         self.set_tooltip_text(
             f"{self.info['name']}\n{game if live else 'Offline'}"
@@ -344,6 +375,8 @@ class StreamerButton(Gtk.Button):
 
 
 class VideoArea(Gtk.GLArea):
+    _seq = 0
+
     def __init__(self, app, tile=False):
         super().__init__()
         self.app = app
@@ -351,6 +384,10 @@ class VideoArea(Gtk.GLArea):
         # must stay inert (they'd otherwise drive the window's one-player
         # channel-switch and mute-badge behaviour).
         self.tile = tile
+        VideoArea._seq += 1
+        # Stable identity for the debug log: every player created/stopped/
+        # crossfaded is named so a log reader can follow one element.
+        self.pid = ("T" if tile else "H") + str(VideoArea._seq)
         self.player = None
         self.render_ctx = None
         self._proc_fn = None
@@ -360,6 +397,19 @@ class VideoArea(Gtk.GLArea):
         self.connect("realize", self.on_realize)
         self.connect("render", self.on_render)
         self.connect("unrealize", self.on_unrealize)
+
+    def is_rendering(self):
+        """True once mpv has a configured video output AND is past the first
+        frame. Used to time the crossfade so it never covers a black frame."""
+        p = self.player
+        if p is None:
+            return False
+        try:
+            if not p.vo_configured:
+                return False
+            return not p.core_idle
+        except Exception:
+            return False
 
     def on_realize(self, *a):
         self.make_current()
@@ -393,7 +443,15 @@ class VideoArea(Gtk.GLArea):
         self.player = mpv.MPV(
             vo="libmpv",
             gpu_api="opengl",
-            hwdec="auto-safe",
+            # Tiles must never hardware-decode via auto-safe: ffmpeg's Vulkan
+            # hwaccel probe segfaults on this machine's radv (core dump:
+            # libavutil -> vkEnumerateInstanceExtensionProperties -> call
+            # through a NULL pointer on a thread named "core"). auto-safe
+            # ENUMERATES Vulkan; an explicit vaapi request does not. TILE_HWDEC
+            # is read from OMATV_TILE_HWDEC so the choice can be A/B tested
+            # without an edit; the shipped value is whatever the 60s
+            # source-quality run proved stable (see report).
+            hwdec=(TILE_HWDEC if self.tile else "auto-safe"),
             network_timeout="20",
             osd_level="0",
             # Low-latency live tuning: cap how much mpv buffers ahead.
@@ -417,8 +475,9 @@ class VideoArea(Gtk.GLArea):
         def on_end(event):
             reason = getattr(event.data, "reason", None) if event.data else None
             reason_name = getattr(reason, "name", None) if reason is not None else None
-            if not self.tile:
-                idle(self.app.on_playback_ended, reason_name)
+            # Every player is a tile now; the window acts only if this one is
+            # the current watch player (on_player_event checks that).
+            idle(self.app.on_player_event, reason_name, self)
 
         self.render_ctx = mpv.MpvRenderContext(
             self.player,
@@ -534,6 +593,10 @@ class OmatvWindow(Adw.ApplicationWindow):
         title_label = Gtk.Label(label="omatv")
         title_label.add_css_class("title")
         title_label.set_halign(Gtk.Align.CENTER)
+        # A long channel/title string must never be able to set the window's
+        # minimum width: ellipsize so the header can always shrink.
+        title_label.set_ellipsize(Pango.EllipsizeMode.END)
+        title_label.set_max_width_chars(16)
         self.subtitle = Gtk.Label(label="pick a streamer to start watching")
         self.subtitle.add_css_class("subtitle")
         self.subtitle.add_css_class("dim-label")
@@ -543,6 +606,10 @@ class OmatvWindow(Adw.ApplicationWindow):
         self.game_pill = Gtk.Label(label="")
         self.game_pill.add_css_class("game-pill")
         self.game_pill.set_halign(Gtk.Align.CENTER)
+        # Long game names ("The Legend of Zelda: Ocarina of Time") must be
+        # allowed to shrink, not force the window wider.
+        self.game_pill.set_ellipsize(Pango.EllipsizeMode.END)
+        self.game_pill.set_max_width_chars(18)
         self.game_pill.set_visible(False)
         subtitle_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         subtitle_row.set_halign(Gtk.Align.CENTER)
@@ -570,6 +637,9 @@ class OmatvWindow(Adw.ApplicationWindow):
         self.user_avatar = Adw.Avatar.new(28, "?", False)
         self.user_avatar.set_show_initials(True)
         user_name = Gtk.Label(label="…")
+        # A long username must not be able to set the window's minimum width.
+        user_name.set_ellipsize(Pango.EllipsizeMode.END)
+        user_name.set_max_width_chars(14)
         user_chip.append(self.user_avatar)
         user_chip.append(user_name)
         self.user_btn.set_child(user_chip)
@@ -591,16 +661,27 @@ class OmatvWindow(Adw.ApplicationWindow):
         rail_scroll = Gtk.ScrolledWindow()
         rail_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
         rail_scroll.set_max_content_height(64)
+        # The rail carries one button per followed channel (87 of them here).
+        # Its own minimum must not become the window's minimum.
+        rail_scroll.set_min_content_width(1)
         self.rail = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
             spacing=6,
-            margin_start=12,
+            # No leading margin: the home button sits immediately left of this
+            # scroller, so a 12px inside margin read as an oversized gap between
+            # the home circle and the first channel. The channel pitch (6px of
+            # box spacing plus each button's own 2px inset) is the gap the home
+            # button has to match.
+            margin_start=0,
             margin_end=12,
             margin_top=4,
             margin_bottom=8,
         )
-        self.rail.set_halign(Gtk.Align.CENTER)
+        # Start-aligned: with the home button pinned outside the scroller the row
+        # should begin immediately, never be re-centred.
+        self.rail.set_halign(Gtk.Align.START)
         rail_scroll.set_child(self.rail)
+        self.rail_scroll = rail_scroll
 
         # Home button pinned left of the scrollable channel rail.
         rail_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -613,25 +694,63 @@ class OmatvWindow(Adw.ApplicationWindow):
         toolbar.add_top_bar(header)
         toolbar.add_top_bar(rail_bar)
 
-        self.video_stack = Gtk.Stack()
-        placeholder = Adw.StatusPage(
-            icon_name="video-display-symbolic",
-            title="Nothing playing",
-            description="Click a streamer above to start watching.",
+        # ---- content surface ------------------------------------------------
+        # A single Gtk.Fixed holds every tile's GLArea AND is where the tile
+        # that becomes the watch video is grown. A realized GLArea cannot move
+        # between containers without being unrealized (which frees its mpv
+        # render context and terminates the player), so the home grid and the
+        # watch video MUST share a parent — this surface. Because every stream
+        # is loaded once at SOURCE quality, selecting a tile only MOVES it: no
+        # new player, no new streamlink, no reload, on screen from frame one.
+        self.surface = home.GridSurface()
+        self.surface.set_valign(Gtk.Align.START)
+        self.grid_scroller = Gtk.ScrolledWindow()
+        self.grid_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.grid_scroller.set_child(self.surface)
+        self.grid_scroller.set_hexpand(True)
+        self.grid_scroller.set_vexpand(True)
+        # A Gtk.Fixed reports its children's extent as its minimum, so a tile
+        # grown to nearly the whole window would make the window's minimum that
+        # wide and clip the right edge. Cap the propagated minimum here; the
+        # scroller still allocates the surface the full viewport width, so the
+        # grid just reflows to fit.
+        #
+        # GOTCHA, measured: min-content-width only caps the minimum while the
+        # horizontal policy is NOT NEVER. With PolicyType.NEVER this cap was a
+        # no-op, so a tile grown to the watch rect still floored the window at
+        # ~1556px and clipped the right edge. Every grid_scroller policy below
+        # must therefore stay AUTOMATIC horizontally - flipping one back to
+        # NEVER silently re-breaks resizing.
+        self.grid_scroller.set_min_content_width(1)
+        self.grid_scroller.set_min_content_height(1)
+
+        self.home_page = home.HomePage(self, VideoArea, self.surface, self.grid_scroller)
+
+        content_overlay = Gtk.Overlay()
+        content_overlay.set_child(self.grid_scroller)
+        content_overlay.set_overflow(Gtk.Overflow.HIDDEN)
+        self.content_overlay = content_overlay
+
+        # nobody-live state (themed status page, fades in/out)
+        self.empty_revealer = Gtk.Revealer(
+            transition_type=Gtk.RevealerTransitionType.CROSSFADE,
+            transition_duration=home.MOTION_MS,
+            child=self.home_page.empty,
         )
-        placeholder.add_css_class("dim-placeholder")
+        content_overlay.add_overlay(self.empty_revealer)
 
-        self.video = VideoArea(self)
-        self.video_stack.add_named(placeholder, "placeholder")
-        self.video_stack.add_named(self.video, "video")
-
-        video_overlay = Gtk.Overlay()
-        video_overlay.set_child(self.video_stack)
+        # Chrome that sits over the watch video. Its background is transparent
+        # on purpose: the tile grown underneath must show through it.
+        self.video_hud = Gtk.Fixed()
+        self.video_hud.set_overflow(Gtk.Overflow.HIDDEN)
+        self.watch_chrome = Gtk.Overlay()
+        self.watch_chrome.set_child(Gtk.Box())
         self.status_revealer = Gtk.Revealer(
             valign=Gtk.Align.START,
             halign=Gtk.Align.CENTER,
             transition_type=Gtk.RevealerTransitionType.CROSSFADE,
         )
+        self.status_revealer.set_margin_top(14)
         status_pill = Gtk.Box(spacing=8)
         status_pill.add_css_class("osd-pill")
         self.spinner = Gtk.Spinner(spinning=False)
@@ -639,9 +758,8 @@ class OmatvWindow(Adw.ApplicationWindow):
         status_pill.append(self.spinner)
         status_pill.append(self.status_label)
         self.status_revealer.set_child(status_pill)
-        video_overlay.add_overlay(self.status_revealer)
+        self.watch_chrome.add_overlay(self.status_revealer)
 
-        # Persistent mute badge — stays visible in the top-right while muted.
         self.mute_badge = Gtk.Label(label="🔇 Muted")
         self.mute_badge.add_css_class("mute-badge")
         self.mute_badge.set_halign(Gtk.Align.END)
@@ -649,93 +767,84 @@ class OmatvWindow(Adw.ApplicationWindow):
         self.mute_badge.set_margin_top(14)
         self.mute_badge.set_margin_end(14)
         self.mute_badge.set_visible(False)
-        video_overlay.add_overlay(self.mute_badge)
+        self.watch_chrome.add_overlay(self.mute_badge)
 
-        video_overlay.set_hexpand(True)
-        video_overlay.set_vexpand(True)
+        # Fullscreen + chat toggles live in the header so they are reachable
+        # at any window size (the video chrome itself can be too small).
+        self.fs_btn = Gtk.Button.new_from_icon_name("view-fullscreen-symbolic")
+        self.fs_btn.add_css_class("flat")
+        self.fs_btn.set_tooltip_text("Fullscreen (double-click the video)")
+        self.fs_btn.connect("clicked", lambda *a: self.toggle_fullscreen())
+        header.pack_end(self.fs_btn)
 
+        self.chat_btn = Gtk.ToggleButton.new()
+        self.chat_btn.set_icon_name("sidebar-show-symbolic")
+        self.chat_btn.add_css_class("flat")
+        self.chat_btn.set_tooltip_text("Chat")
+        self.chat_btn.connect("toggled", self._on_chat_toggle)
+        header.pack_end(self.chat_btn)
+
+        self.video_hud.put(self.watch_chrome, 0, 0)
+        self.watch_chrome.set_visible(False)
+        content_overlay.add_overlay(self.video_hud)
+
+        # --- why the hud is anchored top-left and sized, not can_target(False)
+        # (1) A Gtk.Fixed picks ITSELF across its whole allocation and
+        # Gtk.Overlay hands an overlay child the full area by default, so a
+        # full-size video_hud sits ON TOP of the grid scroller and swallows
+        # every tile click. Measured with pick(): a click at a home tile centre
+        # returned `Fixed` (video_hud) instead of the tile, so the tile's
+        # GestureClick never fired and clicking a stream did nothing.
+        # (2) can_target(False) is NOT the fix: it makes the whole SUBTREE
+        # unpickable. Measured: with it, a click on the watch video skipped
+        # watch_chrome and reached the grown tile underneath, killing the
+        # mute/fullscreen gestures.
+        # So the hud is anchored top-left (natural size, not filled) and sized
+        # to the video rect on the watch view / to nothing on home. Overlay
+        # children do not contribute to the window minimum (verified: the
+        # window's minimum stays 360px with the hud at 601x401).
+        self.video_hud.set_halign(Gtk.Align.START)
+        self.video_hud.set_valign(Gtk.Align.START)
+        self.video_hud.set_size_request(0, 0)
+        # The nobody-live page is never interactive, so it must never be able
+        # to block a click that belongs to the grid.
+        self.empty_revealer.set_can_target(False)
+
+        # scroll + click over the watch video
         scroll = Gtk.EventControllerScroll(
             flags=Gtk.EventControllerScrollFlags.BOTH_AXES
         )
         scroll.connect("scroll", self.on_video_scroll)
-        video_overlay.add_controller(scroll)
-
+        self.watch_chrome.add_controller(scroll)
         self._click_timer = None
         click = Gtk.GestureClick(button=0)
         click.connect("released", self.on_video_click)
-        video_overlay.add_controller(click)
+        self.watch_chrome.add_controller(click)
 
+        # ---- chat overlay (never contributes to the minimum width) -------
         self.webview = self.build_chat_view()
-
-        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        paned.set_start_child(video_overlay)
-        paned.set_end_child(self.webview)
-        paned.set_shrink_start_child(True)
-        paned.set_shrink_end_child(False)
-        # Only the video side should absorb window resizes; the chat keeps
-        # its dragged width instead of growing with the window.
-        paned.set_resize_start_child(True)
-        paned.set_resize_end_child(False)
-        self.paned = paned
+        self.chat_pref = True
+        # Fixed width by design. Drag-to-resize was removed: the width was
+        # persisted and could exceed what the window could fit, which made
+        # effective_chat_width() return 0 and the chat vanish at its maximum.
         self.chat_width = DEFAULT_CHAT_WIDTH
-        settings = load_settings()
-        saved_chat = settings.get("chat_width")
-        if isinstance(saved_chat, int) and saved_chat >= DEFAULT_CHAT_WIDTH:
-            self.chat_width = saved_chat
-        paned.set_position(
-            self.get_width() - self.chat_width if self.get_width() > 700 else 1080
+        self.webview.set_size_request(CHAT_MIN_W, -1)
+
+        # No drag handle: the chat width is fixed (see above).
+        self.chat_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        self.chat_box.append(self.webview)
+
+        self.chat_revealer = Gtk.Revealer(
+            transition_type=Gtk.RevealerTransitionType.SLIDE_RIGHT,
+            transition_duration=home.MOTION_MS,
+            child=self.chat_box,
+            reveal_child=False,
         )
-        self.webview.set_size_request(320, -1)
+        self.chat_revealer.set_halign(Gtk.Align.END)
+        self.chat_revealer.set_valign(Gtk.Align.FILL)
+        content_overlay.add_overlay(self.chat_revealer)
 
-        # persist divider position when the user drags it
-        self._paned_save_timer = None
-
-        def on_paned_move(*a):
-            # Only treat position changes as a user drag if the pointer is
-            # over the paned (drag gesture) — otherwise it's a WM resize and
-            # we must NOT let it corrupt the saved chat width.
-            if self._pin_started and self._user_dragging:
-                if self._paned_save_timer:
-                    GLib.source_remove(self._paned_save_timer)
-                self._paned_save_timer = GLib.timeout_add(400, self.save_chat_width)
-            else:
-                # WM resize or programmatic move: re-pin instead of saving
-                if self._pin_started:
-                    self._re_pin()
-
-        paned.connect("notify::position", on_paned_move)
-        self._pin_started = False
-        self._user_dragging = False
-
-        # Track actual user drags on the divider
-        def on_drag_begin(*a):
-            self._user_dragging = True
-            return True
-
-        def on_drag_end(*a):
-            self._user_dragging = False
-            return False
-
-        # Gtk.Paned divider is draggable via its own gesture; use the
-        # position-notify + pointer state heuristic: if position changes while
-        # a button is held, it's a drag.
-        self._btn_down = False
-        self._btn_gesture = Gtk.GestureClick(button=0)
-        self._btn_gesture.connect("pressed", on_drag_begin)
-        self._btn_gesture.connect("released", on_drag_end)
-        paned.add_controller(self._btn_gesture)
-
-        # Content stack: home (full width) slides to the watch page. home is
-        # first, so the app opens on home.
-        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        content.append(paned)
-        self.home_page = home.HomePage(self, VideoArea)
-        self.content_stack = Gtk.Stack()
-        self.content_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
-        self.content_stack.set_transition_duration(250)
-        self.content_stack.add_named(self.home_page, "home")
-        self.content_stack.add_named(content, "watch")
-        self.toast_overlay.set_child(self.content_stack)
+        self.toast_overlay.set_child(content_overlay)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         root.append(toolbar)
@@ -750,47 +859,175 @@ class OmatvWindow(Adw.ApplicationWindow):
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
 
+        # ---- layout state ------------------------------------------------
+        self.view = "home"
+        self.watch_tile = None
+        self.watch_channel = None
+        self.watch_display = None
+        self._chat_btn_guard = False
+        self.ui_anim = home.Anim(self)
+        self.home_page.set_active(True)
+
+        # Real size changes drive the layout. The old 200ms Paned pin loop is
+        # gone: there is no Paned to fight the WM for, and the chat is an
+        # overlay whose width we clamp ourselves.
+        #
+        # GOTCHA, measured: a GTK4 widget has NO "width"/"height" GObject
+        # properties (find_property("width") is None), so `notify::width` on
+        # the scroller NEVER fires. The grid was therefore laid out once at
+        # startup and never again: resizing the window left every tile at its
+        # old cell, so below ~941px the tiles overflowed the content area and
+        # the scroller grew a horizontal scrollbar. The scroller's horizontal
+        # adjustment is what actually changes on a resize - its "changed" and
+        # "notify::page-size" fire with the NEW scroller width already set.
+        hadj = self.grid_scroller.get_hadjustment()
+        hadj.connect("changed", self._on_content_resize)
+        hadj.connect("notify::page-size", self._on_content_resize)
+        self.grid_scroller.get_vadjustment().connect("changed", self._on_content_resize)
+
         self.connect("map", self.on_first_map)
+
+        # Never leave streamlink processes behind. Each tile's streamlink is a
+        # separate child that outlives the window: measured, closing omatv
+        # normally left one `streamlink --twitch-low-latency` per live tile
+        # running forever, each still pulling bandwidth (an earlier session
+        # found ten of them). Kill them on window close AND on application
+        # shutdown, because quit / Ctrl+Q destroys the window without a
+        # close-request.
+        self.connect("close-request", lambda *a: (self.cleanup_players(), False)[1])
+        app.connect("shutdown", lambda *a: self.cleanup_players())
 
         action_quit = Gio.SimpleAction(name="quit")
         action_quit.connect("activate", lambda *a: app.quit())
         self.add_action(action_quit)
         app.set_accels_for_action("win.quit", ["<Ctrl>q"])
 
+    # ---- responsive layout ------------------------------------------------
+    def _content_size(self):
+        w = self.grid_scroller.get_width()
+        h = self.grid_scroller.get_height()
+        if w <= 0:
+            w = self.get_width()
+        if h <= 0:
+            h = self.get_height()
+        return w, h
+
+    def chat_fits(self):
+        w, _ = self._content_size()
+        return w >= CHAT_COLLAPSE_W
+
+    def effective_chat_width(self):
+        w, _ = self._content_size()
+        maxw = max(0, w - VIDEO_MIN_W)
+        if maxw < CHAT_MIN_W:
+            return 0
+        return max(CHAT_MIN_W, min(self.chat_width, maxw))
+
+    def video_rect(self):
+        w, h = self._content_size()
+        return (0, 0, max(1, w), max(1, h))
+
+    def _full_video_rect(self):
+        """The rect a tile grows into on the watch view (surface coords).
+
+        Clamped so the chat never takes space the window does not have and
+        the video is never asked for more than the content area provides.
+        """
+        w, h = self._content_size()
+        open_chat = self.chat_pref and self.chat_fits()
+        cw = self.effective_chat_width() if open_chat else 0
+        return (0, 0, max(1, w - cw), max(1, h))
+
+    def _on_content_resize(self, *a):
+        # The adjustment signals also fire when only the surface's extent
+        # changes (e.g. every frame of a grow tween). Only re-lay-out when the
+        # content area's own size really changed, or the grow animation would
+        # be restarted on every frame.
+        size = self._content_size()
+        if size == getattr(self, "_last_content_size", None):
+            return
+        self._last_content_size = size
+        home.dbg(f"content resize {size[0]}x{size[1]}")
+        self._apply_layout(snap=True)
+        self.home_page._queue_reflow()
+
+    def _on_chat_toggle(self, btn):
+        if self._chat_btn_guard:
+            return
+        self.chat_pref = btn.get_active()
+        self._apply_layout()
+
+    def _apply_layout(self, snap=False):
+        w, h = self._content_size()
+        fits = self.chat_fits()
+        open_chat = self.chat_pref and fits and self.view == "watch"
+        cw = self.effective_chat_width() if open_chat else 0
+        if cw == 0:
+            open_chat = False
+        if self.chat_revealer.get_reveal_child() != bool(cw):
+            self.chat_revealer.set_reveal_child(bool(cw))
+        if cw:
+            self.webview.set_size_request(max(CHAT_MIN_W, cw), -1)
+        # keep the toggle's visual state in sync without recursing
+        if self.chat_btn.get_active() != bool(open_chat):
+            self._chat_btn_guard = True
+            self.chat_btn.set_active(bool(open_chat))
+            self._chat_btn_guard = False
+        # the grown tile / chrome fill the video rect on the watch view
+        vr = self._full_video_rect()
+        if self.view == "watch":
+            # The hud must cover EXACTLY the video rect: it carries the
+            # mute/fullscreen gestures, and while it covers the grid it must
+            # not cover a single pixel the grid needs for clicks.
+            self.video_hud.set_size_request(vr[2], vr[3])
+        else:
+            self.video_hud.set_size_request(0, 0)
+        if self.watch_tile is not None:
+            self.watch_chrome.set_size_request(vr[2], vr[3])
+            self.video_hud.move(self.watch_chrome, 0, 0)
+            if self.view == "watch":
+                # keep the grown video filling the (possibly new) video rect
+                if snap:
+                    # A content resize must place the video NOW, not animate
+                    # it: the grow tween restarts on every resize event that
+                    # Hyprland streams, so the tile lags the window edge and
+                    # the player drifts away from the video area.
+                    self.home_page.snap_tile(self.watch_tile, vr)
+                else:
+                    self.home_page.grow_tile(self.watch_tile, vr)
+
+    def set_home_empty(self, empty):
+        want = bool(empty) and self.view == "home"
+        if self.empty_revealer.get_reveal_child() != want:
+            self.empty_revealer.set_reveal_child(want)
+
+    def is_watch_tile(self, tile):
+        return tile is self.watch_tile
+
     def on_first_map(self, *a):
-        width = self.get_width()
-        if width > 700:
-            self.paned.set_position(width - self.chat_width)
-        self.start_chat_pin()
+        self._apply_layout()
 
-    def start_chat_pin(self):
-        self._pin_started = True
-        # Re-pin the chat to its saved width whenever it drifts (WM resize).
-        def pin():
-            if self._user_dragging:
-                return True
-            self._re_pin()
-            return True
-        GLib.timeout_add(200, pin)
+    def cleanup_players(self):
+        """Kill every tile's streamlink and stop every player (idempotent).
 
-    def _re_pin(self):
-        width = self.get_width()
-        if width > 700:
-            desired = width - self.chat_width
-            if self.paned.get_position() != desired:
-                self.paned.set_position(desired)
-
-    def save_chat_width(self):
-        width = self.get_width()
-        if width <= 0:
+        Wired to close-request and to the application's shutdown signal, so no
+        streamlink child survives omatv's exit.
+        """
+        page = getattr(self, "home_page", None)
+        if page is None:
             return False
-        pos = self.paned.get_position()
-        chat = max(DEFAULT_CHAT_WIDTH, width - pos)
-        self.chat_width = chat
-        settings = load_settings()
-        settings["chat_width"] = chat
-        save_settings(settings)
-        self._paned_save_timer = None
+        for tile in list(page.tiles.values()):
+            tile.want = False
+            try:
+                page._kill_tile(tile)
+            except Exception:
+                pass
+            try:
+                if tile.va.player is not None:
+                    tile.va.player.command("stop")
+            except Exception:
+                pass
+        home.dbg("cleanup: all tile streamlinks killed, all players stopped")
         return False
 
     def build_chat_view(self):
@@ -1035,16 +1272,26 @@ class OmatvWindow(Adw.ApplicationWindow):
         toast = Adw.Toast(title=text, timeout=timeout)
         self.toast_overlay.add_toast(toast)
 
+    # ---- watch video: mute / volume / fullscreen --------------------------
+    def watch_player(self):
+        tile = self.watch_tile
+        if tile is None or tile.va is None or tile.va.player is None:
+            return None
+        return tile.va.player
+
     def on_video_scroll(self, ctrl, dx, dy):
-        if not self.video.player:
+        player = self.watch_player()
+        if player is None:
             return False
         try:
-            vol = float(self.video.player.volume)
+            vol = float(player.volume)
         except Exception:
             return False
-        step = 5 if abs(dy) >= abs(dx) else 5
-        new_vol = vol - step if (dy + dx) > 0 else vol + step
-        self.video.set_volume(new_vol)
+        new_vol = vol - 5 if (dy + dx) > 0 else vol + 5
+        try:
+            player.volume = max(0, min(130, new_vol))
+        except Exception:
+            return False
         self.flash_status(f"Volume {int(new_vol)}%", transient=True)
         return True
 
@@ -1060,8 +1307,6 @@ class OmatvWindow(Adw.ApplicationWindow):
                 SINGLE_CLICK_DELAY_MS, self._single_click_mute
             )
         elif b == 1 and n == 2:
-            # Exactly the 2nd press of a group: n=3+ would toggle straight
-            # back out of fullscreen.
             self._cancel_click_timer()
             self.toggle_fullscreen()
         elif b == 8:
@@ -1075,9 +1320,14 @@ class OmatvWindow(Adw.ApplicationWindow):
 
     def _single_click_mute(self):
         """One-shot: a click that no second click followed. The persistent
-        badge (top-right) reflects mpv's mute state."""
+        badge (top-right) reflects mpv's real mute state."""
         self._click_timer = None
-        self.video.toggle_mute()
+        player = self.watch_player()
+        if player is not None:
+            try:
+                player.mute = not player.mute
+            except Exception:
+                pass
         return False
 
     def toggle_fullscreen(self):
@@ -1088,7 +1338,31 @@ class OmatvWindow(Adw.ApplicationWindow):
 
     def on_mute_changed(self, muted):
         """Show/hide the persistent mute badge from mpv's real mute state."""
-        self.mute_badge.set_visible(bool(muted) and self.video.player is not None)
+        self.mute_badge.set_visible(bool(muted) and self.watch_player() is not None)
+
+    def _observe_watch_mute(self):
+        self._unobserve_watch_mute()
+        player = self.watch_player()
+        if player is None:
+            return
+
+        def cb(_name, val):
+            GLib.idle_add(lambda: (self.on_mute_changed(bool(val)), False)[1])
+
+        try:
+            self._mute_observer = player.observe_property("mute", cb)
+        except Exception as e:
+            print("watch mute observe failed:", e, flush=True)
+            self._mute_observer = None
+
+    def _unobserve_watch_mute(self):
+        obs = getattr(self, "_mute_observer", None)
+        if obs is not None:
+            try:
+                obs.unobserve()
+            except Exception:
+                pass
+        self._mute_observer = None
 
     def hide_mute_badge(self):
         self.mute_badge.set_visible(False)
@@ -1117,32 +1391,79 @@ class OmatvWindow(Adw.ApplicationWindow):
     def hide_status(self):
         self.status_revealer.set_reveal_child(False)
 
+    def _hide_status_on_video(self, tile):
+        """Clear the status pill as soon as this tile's player has real video.
+
+        Used when the top bar starts a tile that was not decoding, so the pill
+        cannot linger after the picture is up, and cannot get stuck either.
+        """
+        player = tile.va.player
+        if player is None:
+            return
+
+        def cb(_name, value):
+            if value:
+                GLib.idle_add(self.hide_status)
+
+        try:
+            player.observe_property("vo-configured", cb)
+        except Exception as e:
+            print("vo-configured observe failed:", e, flush=True)
+        GLib.timeout_add_seconds(8, lambda: (self.hide_status(), False)[1])
+
     def update_header(self, display_name, title, game):
-        """Set the header to show channel name + stream title + game pill."""
-        self.title_label.set_text(display_name)
+        """Set the header only when the text actually changed.
+
+        The 60s poll calls this every minute; blindly calling set_text() there
+        re-laid the header out and made it jitter. Now unchanged text is a
+        no-op (and is logged as a skip).
+        """
+        changed = []
+        if self.title_label.get_text() != display_name:
+            self.title_label.set_text(display_name)
+            changed.append("name")
         if title:
-            self.subtitle.set_text(title)
             self.subtitle.remove_css_class("dim-label")
-            self.subtitle.set_tooltip_text(title)
+            if self.subtitle.get_text() != title:
+                self.subtitle.set_text(title)
+                changed.append("title")
+            if self.subtitle.get_tooltip_text() != title:
+                self.subtitle.set_tooltip_text(title)
         else:
-            self.subtitle.set_text("pick a streamer to start watching")
             self.subtitle.add_css_class("dim-label")
+            if self.subtitle.get_text() != "pick a streamer to start watching":
+                self.subtitle.set_text("pick a streamer to start watching")
+                changed.append("title")
         if game:
-            self.game_pill.set_text(game)
-            self.game_pill.set_visible(True)
+            if self.game_pill.get_text() != game:
+                self.game_pill.set_text(game)
+                changed.append("game")
+            if not self.game_pill.get_visible():
+                self.game_pill.set_visible(True)
+                changed.append("game-vis")
         else:
-            self.game_pill.set_text("")
-            self.game_pill.set_visible(False)
+            if self.game_pill.get_visible():
+                self.game_pill.set_visible(False)
+                changed.append("game-vis")
+            if self.game_pill.get_text():
+                self.game_pill.set_text("")
+        if changed:
+            home.dbg(
+                f"header set [{','.join(changed)}] name='{display_name}' "
+                f"title='{(title or '')[:40]}' game='{game}'"
+            )
+        else:
+            home.dbg("header skip (unchanged)")
 
     def poll_stream_info(self):
         """Periodic refresh of the header title/game while a stream is
         playing (streamers retitle / change games mid-stream). Returns True
         to keep the timer alive."""
-        login = self.current_channel
-        if not login or self.video_stack.get_visible_child_name() != "video":
+        login = self.watch_channel if self.view == "watch" else None
+        if not login:
             return False
         gen = self.resolve_gen
-        display = self.current_display_name or login
+        display = self.watch_display or login
 
         def work():
             try:
@@ -1155,7 +1476,6 @@ class OmatvWindow(Adw.ApplicationWindow):
                 GLib.idle_add(
                     self.update_header, display, info.get("title", ""), info.get("game", "")
                 )
-                # Keep the chat header viewer count fresh while playing.
                 GLib.idle_add(
                     self.push_js,
                     {"type": "viewer_count", "viewers": info.get("viewers", 0)},
@@ -1164,145 +1484,414 @@ class OmatvWindow(Adw.ApplicationWindow):
         threading.Thread(target=work, daemon=True).start()
         return True
 
-    def play_channel(self, login, name=None, channel_id=None):
+    # ---- view navigation --------------------------------------------------
+    def select_tile(self, tile):
+        """A grid tile was clicked: grow it into the watch video (same player)."""
+        self._select(tile.login, tile.name, tile.cid, tile)
+
+    def open_channel(self, login, name=None, channel_id=None):
+        """Rail button / CLI: open a channel on the watch view."""
         login = login.lower()
-        if self.current_channel == login and self.video_stack.get_visible_child_name() == "video":
+        tile = self.home_page.find_tile(login=login, cid=channel_id)
+        self._select(login, name or login, channel_id, tile)
+
+    # back-compat for the CLI arg path
+    play_channel = open_channel
+
+    def _select(self, login, name, channel_id, tile):
+        login = login.lower()
+        if self.view == "watch" and self.watch_channel == login:
             return
-        # Resolve the channel ID if not provided, so the chat/emote loader
-        # always has a valid broadcaster id (empty -> Twitch 400s).
-        if not channel_id:
-            try:
-                channel_id = self.api.get_user_id(login) or None
-            except Exception:
-                channel_id = None
+        if tile is None and self.view == "watch":
+            # Rail click on a channel with no grid tile means it is not live.
+            # Do not tear down the stream that is playing for a dead one.
+            home.dbg(f"select {login}: no tile (not live) — staying on {self.watch_channel}")
+            self.show_toast(f"{name or login} is offline")
+            return
+
+        # (f) SAME FRAME: the previously watched channel leaves NOW. Its tile
+        # is snapped back to its grid cell and its decoding stopped before the
+        # new tile starts growing, so no frame of the old channel can render
+        # on the watch page after the new selection.
+        prev = self.watch_tile
+        if prev is not None and prev is not tile:
+            prev_login, prev_uid, prev_pid = prev.login, prev.uid, prev.va.pid
+            self.home_page.set_tile_watch(prev, False)
+            self.home_page.snap_home(prev)
+            self.home_page.fade_tile(prev, 0.0)
+            self.home_page._stop_tile(prev)
+            home.dbg(
+                f"select {login}: old watch player LEAVE channel={prev_login} "
+                f"tile={prev_uid} player={prev_pid} (snap home + stop, same frame)"
+            )
+        self._unobserve_watch_mute()
+
+        self.view = "watch"
+        self.watch_tile = tile
+        self.watch_channel = login
+        self.watch_display = name or login
         self.current_channel = login
         self.current_display_name = name or login
         self.resolve_gen += 1
+
+        # The grid must IDLE while the watch view is up. Selecting a tile has to
+        # put the PAGE in watch mode too, not just the window: otherwise the
+        # viewport sync below (the scroll reset fires value-changed) sees
+        # mode == "home" and restarts every other tile, so they keep decoding
+        # behind the video. Measured: after a click, the non-watched tile still
+        # had want=True + a live streamlink.
+        self.home_page.set_mode("watch")
+        self.home_page.set_active(False)
+
+        running = sorted(
+            (t.uid, t.va.pid, id(t.streamlink_proc))
+            for t in self.home_page.tiles.values()
+            if t.streamlink_proc is not None
+        )
+        home.dbg(
+            f"select {login}: running tile players before/after grow "
+            f"(uid,player,streamlink)={running} — select adds none"
+        )
+
+        # The watch view does not scroll; the grown tile lives at the top.
+        # The VERTICAL policy must still NOT be NEVER: set_min_content_height
+        # is a no-op under NEVER (the exact gotcha that broke the WIDTH once),
+        # so with NEVER the scroller's minimum height becomes the whole hidden
+        # grid's depth - measured 2836px at a 640px-wide window - and the watch
+        # video area is then sized to that clipped, too-tall box, centring the
+        # picture far below the window (black band on top, bottom cut off).
+        # It stays AUTOMATIC; the watch view stays unscrollable because
+        # set_mode() drops every non-watch tile out of the surface's layout.
+        self.grid_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.grid_scroller.get_vadjustment().set_value(0)
+
+        # chat follows the selected channel (same WebView, never rebuilt)
+        self.push_js(
+            {"type": "channel", "login": login, "name": name or login, "id": channel_id}
+        )
+
+        self.watch_chrome.set_visible(True)
+        self.watch_chrome.set_opacity(0.0)
+        vr = self._full_video_rect()
+        self.watch_chrome.set_size_request(vr[2], vr[3])
+        self.video_hud.set_size_request(vr[2], vr[3])
+        self.video_hud.move(self.watch_chrome, 0, 0)
+
+        if tile is not None:
+            # RAIL SWITCH: choosing a channel from the top bar skips the home
+            # screen, and home is what fades the tiles back in. Selecting any
+            # channel faded every OTHER tile to 0.0 and stopped it, so growing
+            # this tile as-is showed an invisible, dead video area - the black
+            # screen when switching from the top bar. Restore both first.
+            if tile.get_opacity() < 1.0:
+                home.dbg(
+                    f"select {login}: restore tile opacity {tile.get_opacity():.2f} -> 1.0 (rail switch)"
+                )
+                self.home_page.fade_tile(tile, 1.0)
+            if tile.streamlink_proc is None or not tile.want:
+                home.dbg(f"select {login}: tile not decoding (rail switch) -> starting it")
+                self.flash_status(f"Tuning in {name or login}…")
+                self.home_page._start_tile(tile)
+                self._hide_status_on_video(tile)
+            if tile.va.player is None:
+                # Not realized yet (should not happen for a running tile).
+                tile.va._pending_url = None
+            # (h) NO new player, NO new streamlink: this running tile grows.
+            home.dbg(
+                f"select {login}: watch video child = tile {tile.uid} "
+                f"player={tile.va.pid} (EXISTING player grown; no new player/streamlink)"
+            )
+            self.home_page.set_tile_watch(tile, True)
+            self._observe_watch_mute()
+            self.home_page.grow_tile(tile, vr)
+            for cid in list(self.home_page.order):
+                t = self.home_page.tiles.get(cid)
+                if t is None or t is tile:
+                    continue
+                self.home_page.fade_tile(t, 0.0)
+                self.home_page._stop_tile(t)
+            self.ui_anim.fade("chrome", self.watch_chrome, 0.0, 1.0, label="watch chrome")
+        else:
+            home.dbg(f"select {login}: watch video child = (no live tile yet)")
+            self.watch_chrome.set_opacity(1.0)
+            self.set_busy_status(f"Waiting for {name or login}…")
+
+        self.update_header(name or login, "loading stream…", "")
+        self._apply_layout()
+        self._fetch_watch_info(login, name or login, channel_id)
+
+    def _fetch_watch_info(self, login, display, channel_id):
         gen = self.resolve_gen
-        self.update_header(name or login, f"starting stream…", "")
-        self.set_busy_status(f"Starting {name or login}…")
-        self.video.stop()
-        self.kill_streamlink()
 
         def work():
-            url = ""
-            err = ""
-            # Streamlink in external-http mode downloads the HLS itself and
-            # re-serves it as a continuous HTTP stream on localhost. mpv reads
-            # that like a live pipe (no HLS segment anchoring), which is what
-            # streamlink --player mpv does on the CLI and why it has lower
-            # latency than handing mpv the m3u8 URL directly.
-            for quality in ("best", "720p60", "720p", "worst"):
-                try:
-                    proc = subprocess.Popen(
-                        [
-                            "streamlink",
-                            "--twitch-low-latency",
-                            "twitch.tv/" + login,
-                            quality,
-                            "--player-external-http",
-                            "--player-external-http-port", "0",
-                        ],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                    )
-                    self.streamlink_proc = proc
-                    found_url = None
-                    import re as _re
-                    for line in proc.stdout:
-                        m = _re.search(r"http://(?:127\.0\.0\.1|localhost):(\d+)/", line)
-                        if m:
-                            found_url = "http://127.0.0.1:" + m.group(1) + "/"
-                            break
-                    if found_url:
-                        url = found_url
-                        break
-                    err = "streamlink did not report an HTTP endpoint"
-                except Exception as e:
-                    err = str(e)
-
-            def done():
-                if gen != self.resolve_gen:
-                    self.kill_streamlink()
-                    return False
-                if url:
-                    self.video.play_url(url)
-                    self.video_stack.set_visible_child_name("video")
-                    self.hide_status()
-                    self.update_header(name or login, "loading stream…", "")
-                    self.push_js(
-                        {
-                            "type": "channel",
-                            "login": login,
-                            "name": name or login,
-                            "id": channel_id,
-                        }
-                    )
-                    # Fetch stream info (title + game) in the background and update
-                    # the header when it arrives.
-                    def fetch_info():
-                        try:
-                            info = self.api.stream_info(login)
-                        except Exception:
-                            info = None
-                        if gen != self.resolve_gen:
-                            return
-                        if info:
-                            GLib.idle_add(
-                                self.update_header,
-                                name or login,
-                                info.get("title", ""),
-                                info.get("game", ""),
-                            )
-                            # Tell chat the stream start time for the uptime pill
-                            # plus viewer count for the header.
-                            GLib.idle_add(
-                                self.push_js,
-                                {
-                                    "type": "stream_start",
-                                    "started_at": info.get("started_at", ""),
-                                    "viewers": info.get("viewers", 0),
-                                },
-                            )
-                        else:
-                            GLib.idle_add(self.update_header, name or login, "", "")
-
-                    threading.Thread(target=fetch_info, daemon=True).start()
-                else:
-                    self.kill_streamlink()
-                    self.video_stack.set_visible_child_name("placeholder")
-                    self.hide_status()
-                    self.hide_mute_badge()
-                    self.update_header("omatv", "", "")
-                    self.show_toast(f"Could not open {name or login}: {err or 'stream unavailable'}", timeout=6)
-                return False
-
-            GLib.idle_add(done)
+            try:
+                info = self.api.stream_info(login)
+            except Exception:
+                info = None
+            if gen != self.resolve_gen:
+                return
+            if info:
+                GLib.idle_add(
+                    self.update_header, display, info.get("title", ""), info.get("game", "")
+                )
+                GLib.idle_add(
+                    self.push_js,
+                    {
+                        "type": "stream_start",
+                        "started_at": info.get("started_at", ""),
+                        "viewers": info.get("viewers", 0),
+                    },
+                )
+            else:
+                GLib.idle_add(self.update_header, display, "", "")
 
         threading.Thread(target=work, daemon=True).start()
 
-    def kill_streamlink(self):
-        proc = getattr(self, "streamlink_proc", None)
-        if proc:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            self.streamlink_proc = None
+    def enter_watch(self):
+        if self.watch_tile is not None:
+            self.view = "watch"
+            self.home_page.set_mode("watch")
+            self.home_page.set_active(False)
+            self.watch_chrome.set_visible(True)
+            self.watch_chrome.set_opacity(1.0)
+            # Keep the vertical policy AUTOMATIC too: see the long note in
+            # _select - NEVER turns set_min_content_height(1) into a no-op and
+            # floors the whole content area at the hidden grid's depth.
+            self.grid_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+            self._apply_layout()
+            self.home_page.grow_tile(self.watch_tile, self._full_video_rect())
+        elif self.current_channel:
+            self.open_channel(self.current_channel, self.current_display_name)
 
-    def on_playback_ended(self, reason):
+    def enter_home(self):
+        if self.view == "home" and self.watch_tile is None:
+            return
+        home.dbg("nav watch->home")
+        tile = self.watch_tile
+        self.view = "home"
+        self.watch_tile = None
+        self.watch_channel = None
+        self.watch_display = None
+        self.current_channel = None
+        self.current_display_name = None
+        self.home_page.set_mode("home")
+        self.home_page.set_active(True)
+        self.grid_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.grid_scroller.get_vadjustment().set_value(0)
+        self._unobserve_watch_mute()
+        self.watch_chrome.set_visible(False)
+        self.hide_mute_badge()
+        self.hide_status()
+        self.update_header("omatv", "", "")
+        self.push_js({"type": "stream_start", "started_at": "", "viewers": 0})
+        if tile is not None:
+            self.home_page.set_tile_watch(tile, False)
+            # shrink the live video back into its exact grid cell
+            self.home_page.restore_tile(tile)
+        for cid in self.home_page.order:
+            t = self.home_page.tiles.get(cid)
+            if t is not None:
+                self.home_page.fade_tile(t, 1.0)
+        self.set_home_empty(not self.home_page.tiles)
+        self._apply_layout()
+        self.home_page.restart_all()
+
+    def on_player_event(self, reason, area):
+        """mpv END_FILE for any tile; only the watch player acts on it."""
+        if area is None or area is not (self.watch_tile.va if self.watch_tile else None):
+            return False
         if reason == "ERROR":
-            if self.current_channel:
-                self.show_toast(f"Playback error — {self.current_channel} may be offline")
+            if self.watch_channel:
+                self.show_toast(f"Playback error — {self.watch_channel} may be offline")
         elif reason == "EOF":
-            self.video_stack.set_visible_child_name("placeholder")
-            self.current_channel = None
-            self.current_display_name = None
-            self.hide_mute_badge()
-            self.update_header("omatv", "", "")
-            self.push_js({"type": "stream_start", "started_at": "", "viewers": 0})
+            self.show_toast(f"{self.watch_channel} went offline")
+            self.enter_home()
         return False
+
+    # ---- responsive diagnostic (OMATV_UI_SWEEP=1) -------------------------
+    def _min_width(self, widget):
+        try:
+            return widget.get_preferred_size()[0].width
+        except Exception:
+            return -1
+
+    def _debug_min_report(self):
+        widgets = [
+            ("window", self),
+            ("content_root", self.get_content()),
+            ("toolbar", self.get_content().get_first_child()),
+            ("grid_scroller", self.grid_scroller),
+            ("surface", self.surface),
+            ("content_overlay", self.content_overlay),
+            ("rail_scroll", self.rail_scroll),
+            ("rail", self.rail),
+            ("title_label", self.title_label),
+            ("subtitle", self.subtitle),
+            ("game_pill", self.game_pill),
+            ("user_btn", self.user_btn),
+            ("fs_btn", self.fs_btn),
+            ("chat_btn", self.chat_btn),
+            ("home_btn", self.home_btn),
+            ("chat_box", self.chat_box),
+            ("chat_revealer", self.chat_revealer),
+            ("webview", self.webview),
+        ]
+        home.dbg("SWEEP === minimum widths (the window's minimum must be < any width) ===")
+        for name, wdg in widgets:
+            home.dbg(f"SWEEP min {name} = {self._min_width(wdg)}")
+        worst = max(widgets, key=lambda kv: self._min_width(kv[1]))
+        home.dbg(
+            f"SWEEP widest-min widget = {worst[0]} ({self._min_width(worst[1])}px)"
+        )
+
+    def _debug_sweep(self, *_a):
+        widths = [1896, 1400, 1100, 941, 800, 700, 600, 500, 400]
+        # exercise the chat layout path (the thing that can clip)
+        self.chat_pref = True
+        self.view = "watch"
+        self.watch_chrome.set_visible(True)
+        self._apply_layout()
+        self._debug_min_report()
+        # The window is tiled by Hyprland, so a client resize request is
+        # ignored (actual stayed 1896 in an earlier run). Simulate each content
+        # width instead by pinning the scroller to exactly that width, and
+        # report the window's real (width-independent) minimum alongside it —
+        # that minimum is what decides clipping.
+        self.grid_scroller.set_hexpand(False)
+
+        def run(i=0):
+            if i >= len(widths):
+                self.grid_scroller.set_hexpand(True)
+                self.grid_scroller.set_size_request(-1, -1)
+                self._apply_layout()
+                home.dbg("SWEEP done")
+                return False
+            W = widths[i]
+            self.grid_scroller.set_size_request(W, -1)
+
+            def report(W=W, i=i):
+                wmin = self._min_width(self)
+                cw = self._content_size()[0]
+                fits = self.chat_fits()
+                ecw = self.effective_chat_width()
+                open_chat = self.chat_pref and fits and self.view == "watch"
+                cols, cells = self.home_page._compute_cells()
+                tile_w = next(iter(cells.values()))[2] if cells else 0
+                clipped = cw > W + 1
+                home.dbg(
+                    f"SWEEP width={W} content={cw} window_min={wmin} ok={wmin <= W} "
+                    f"clipped={clipped} chat_fits={fits} "
+                    f"chat_w={ecw if open_chat else 0} collapsed={not open_chat} "
+                    f"cols={cols} tile_w={tile_w}"
+                )
+                GLib.timeout_add(160, run, i + 1)
+                return False
+
+            GLib.timeout_add(220, report)
+            return False
+
+        GLib.timeout_add(400, run, 0)
+
+    # ---- scripted nav driver (OMATV_UI_SCRIPT=1) --------------------------
+    def _debug_script(self, *_a):
+        page = self.home_page
+
+        def pick_live(exclude=None):
+            for cid in page.order:
+                t = page.tiles.get(cid)
+                if t is None or t is exclude:
+                    continue
+                if t.va.player is not None:
+                    return t
+            return None
+
+        def cells():
+            return {page.tiles[c].login: tuple(page.tiles[c].cell or ())
+                    for c in page.order if c in page.tiles}
+
+        self._dbg_A = None
+        self._dbg_B = None
+
+        def s0():
+            home.dbg(f"SCRIPT cells@home0={cells()}")
+            t = pick_live()
+            if t is None:
+                home.dbg("SCRIPT no live tile to select A")
+                return False
+            self._dbg_A = t
+            home.dbg(f"SCRIPT select A={t.login} tile={t.uid} player={t.va.pid}")
+            self.select_tile(t)
+            return False
+
+        def s1():
+            home.dbg(f"SCRIPT cells@watchA={cells()}")
+            home.dbg(f"SCRIPT watch_tile={self.watch_tile.login if self.watch_tile else None}")
+            return False
+
+        def s2():
+            home.dbg("SCRIPT enter_home #1")
+            self.enter_home()
+            return False
+
+        def s3():
+            home.dbg(f"SCRIPT cells@home1={cells()} (must equal cells@home0)")
+            b = pick_live(exclude=self._dbg_A)
+            self._dbg_B = b
+            home.dbg(f"SCRIPT select B={b.login if b else None} (different channel)")
+            if b is not None:
+                self.select_tile(b)
+            return False
+
+        def s4():
+            home.dbg(f"SCRIPT cells@watchB={cells()}")
+            home.dbg(
+                "SCRIPT after selecting B: watch_tile="
+                f"{self.watch_tile.login if self.watch_tile else None} "
+                f"A_still_watch={self.watch_tile is self._dbg_A}"
+            )
+            return False
+
+        def s5():
+            home.dbg("SCRIPT enter_home #2")
+            self.enter_home()
+            return False
+
+        def s4b():
+            # Prove (e): call the 60s header refresh repeatedly while watching;
+            # unchanged text must log as a skip, not a set. poll_stream_info
+            # returns True (keep the 60s timer alive) so wrap it: a raw timeout
+            # callback returning True would repeat forever.
+            home.dbg("SCRIPT forcing repeated header refreshes (poll x4)")
+            for i in range(4):
+                GLib.timeout_add(
+                    300 + i * 1300,
+                    lambda: (self.poll_stream_info(), False)[1],
+                )
+            return False
+
+        def s6():
+            home.dbg("SCRIPT simulate the first followed stream leaving (drop head tile)")
+            if page.order:
+                cid = page.order[0]
+                tile = page.tiles.pop(cid)
+                page.order.remove(cid)
+                home.dbg(
+                    f"SCRIPT membership remove {tile.login} tile={tile.uid} (head) "
+                    f"-> the remaining tiles must slide to fill (tween)"
+                )
+                page._reflow(motion=True, departing=[tile])
+            return False
+
+        def s7():
+            home.dbg("SCRIPT done")
+            return False
+
+        for delay, fn in [
+            (10000, s0), (12000, s1), (20000, s2), (32000, s3),
+            (34000, s4), (36000, s4b), (44000, s5), (48000, s6), (56000, s7),
+        ]:
+            GLib.timeout_add(delay, fn)
+
 
     def show_login_dialog(self):
         """Popup asking for an access token + client ID (from
@@ -1548,12 +2137,20 @@ class OmatvWindow(Adw.ApplicationWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def apply_streamers(self, infos):
+        # The rail is updated IN PLACE: a channel button is created once and
+        # kept for the app's life, so a 60s refresh never rebuilds (or pops)
+        # the widgets. New buttons fade in; live dots/count use Revealers.
         existing = {i["id"] for i in infos}
+        removed = []
         for bid in list(self.buttons):
             if bid not in existing:
-                self.buttons[bid].get_parent().remove(self.buttons[bid])
-                del self.buttons[bid]
+                btn = self.buttons.pop(bid)
+                parent = btn.get_parent()
+                if parent is not None:
+                    parent.remove(btn)
+                removed.append(bid)
 
+        added = []
         for info in infos:
             btn = self.buttons.get(info["id"])
             if btn is None:
@@ -1564,8 +2161,14 @@ class OmatvWindow(Adw.ApplicationWindow):
                         self, b.info["login"], b.info["name"], b.info["id"]
                     ),
                 )
+                btn.set_opacity(0.0)
                 self.rail.append(btn)
                 self.buttons[info["id"]] = btn
+                added.append(btn)
+                self.ui_anim.fade(
+                    f"rail-{info['id']}", btn, 0.0, 1.0,
+                    label=f"rail add {info['login']}",
+                )
             else:
                 btn.info.update(info)
             btn.set_state(info["live"], info["game"] or "Offline")
@@ -1576,6 +2179,14 @@ class OmatvWindow(Adw.ApplicationWindow):
                     btn.set_avatar_texture(tex)
                 except Exception:
                     pass
+
+        sig = hashlib.sha1(
+            ",".join(str(id(b)) for b in self.buttons.values()).encode()
+        ).hexdigest()[:12]
+        home.dbg(
+            f"rail apply: n={len(self.buttons)} sig={sig} "
+            f"added={len(added)} removed={len(removed)}"
+        )
 
         # Drive the home grid from the same 60s follows refresh.
         self.home_page.update(infos)
@@ -1669,6 +2280,22 @@ class OmatvApp(Adw.Application):
                         False,
                     )[1],
                 )
+            # Responsive diagnostic: open the first live tile, then sweep the
+            # window through the widths the user asked to be checked.
+            if os.environ.get("OMATV_UI_SWEEP") == "1":
+                def _auto_select():
+                    order = getattr(win.home_page, "order", [])
+                    for cid in order:
+                        t = win.home_page.tiles.get(cid)
+                        if t is not None and t.va.player is not None:
+                            win.select_tile(t)
+                            home.dbg(f"SWEEP auto-selected {t.login} for the sweep")
+                            break
+                    return False
+                GLib.timeout_add(7000, _auto_select)
+                GLib.timeout_add(12000, win._debug_sweep)
+            if os.environ.get("OMATV_UI_SCRIPT") == "1":
+                GLib.timeout_add(2000, win._debug_script)
         win.present()
 
 
