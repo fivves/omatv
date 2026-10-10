@@ -484,13 +484,39 @@ class VideoArea(Gtk.GLArea):
             "opengl",
             opengl_init_params={"get_proc_address": self._proc_fn},
         )
-        self.render_ctx.update_cb = lambda: idle(self.queue_render)
+        self._last_render = 0.0
+
+        def want_render():
+            # Tiles may skip a render tick while the grid is animating: the
+            # video is moving anyway and the UI frame budget is what the eye
+            # notices. mpv asks again on its next frame, so nothing is lost.
+            if self.tile and home.TILE_RENDER_THROTTLE:
+                page = getattr(self.app, "home_page", None)
+                if page is not None and page.anim.busy():
+                    now = time.monotonic()
+                    if now - self._last_render < home.TILE_RENDER_SECS:
+                        return
+                    self._last_render = now
+            idle(self.queue_render)
+
+        self.render_ctx.update_cb = want_render
 
         # Mute badge follows mpv's real mute state; tiles never touch it.
         if not self.tile:
             self.player.observe_property(
                 "mute", lambda _name, val: idle(self.app.on_mute_changed, bool(val))
             )
+
+        # Perf truth in the log: which backend mpv actually picked for this
+        # player (vaapi, or a silent fallback to software). Tile decode cost is
+        # then a fact in the log rather than an assumption about TILE_HWDEC.
+        self.player.observe_property(
+            "hwdec-current",
+            lambda _name, val: print(
+                f"[omatv][hw] {self.pid} tile={self.tile} hwdec-current={val}",
+                flush=True,
+            ),
+        )
 
         if self._pending_url:
             url = self._pending_url
@@ -865,7 +891,7 @@ class OmatvWindow(Adw.ApplicationWindow):
         self.watch_channel = None
         self.watch_display = None
         self._chat_btn_guard = False
-        self.ui_anim = home.Anim(self)
+        self.ui_anim = home.Anim(self, self)
         self.home_page.set_active(True)
 
         # Real size changes drive the layout. The old 200ms Paned pin loop is

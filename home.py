@@ -35,6 +35,84 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
 
 UI_DEBUG = os.environ.get("OMATV_UI_DEBUG", "") not in ("", "0", "false", "no")
+
+# Motion instrumentation (perf work, Oct 2026): OMATV_ANIM_STATS=1 prints one
+# frame-gap report per motion. Frame GAPS, not fps: a gap is what a human feels
+# as a hitch, and the old step-counted engine hid them (a slow frame just ate a
+# step, stretching the tween instead of showing up as a dropped frame).
+FRAME_STATS = os.environ.get("OMATV_ANIM_STATS", "") not in ("", "0", "false", "no")
+
+# Column-change reflows genuinely change every tile's size, so the per-frame
+# GLArea re-allocation cannot be avoided by moving only; it can be paid ONCE per
+# tile instead of once per frame. A/B: OMATV_SNAP_RESIZE=1.
+# ON by default: it measured as the whole difference for a column change
+# (late frames 8-12 of ~15 -> 0-3, p50 back to a locked 16.7ms). Set
+# OMATV_SNAP_RESIZE=0 to go back to tweening the size.
+SNAP_RESIZE = os.environ.get("OMATV_SNAP_RESIZE", "1") not in ("", "0", "false", "no")
+
+# While a grid motion is in flight, tile players may skip render ticks: the
+# picture is moving anyway, and the UI frame budget is what the eye notices.
+# A/B: OMATV_TILE_THROTTLE=1.
+TILE_RENDER_THROTTLE = os.environ.get("OMATV_TILE_THROTTLE", "") not in ("", "0", "false", "no")
+TILE_RENDER_SECS = 1.0 / float(os.environ.get("OMATV_TILE_FPS", "30"))
+
+
+class FrameProbe:
+    """Frame-interval recorder shared by every job in one motion."""
+
+    def __init__(self):
+        self._t0 = None
+        self._last = None
+        self._dts = []
+        self._label = ""
+        self._start_ms = None
+
+    def begin(self, label):
+        if not FRAME_STATS:
+            return
+        self._t0 = time.monotonic()
+        self._last = None
+        self._dts = []
+        self._label = label
+        self._start_ms = None
+
+    def frame(self, now=None):
+        if self._t0 is None:
+            return
+        if now is None:
+            now = time.monotonic()
+        if self._start_ms is None:
+            # Latency from "a motion was asked for" to "the first frame it
+            # actually drew": if this is large, the motion starts late, which is
+            # felt exactly like a low frame rate.
+            self._start_ms = (now - self._t0) * 1000.0
+        if self._last is None:
+            self._last = now
+            return
+        self._dts.append((now - self._last) * 1000.0)
+        self._last = now
+
+    def end(self):
+        if self._t0 is None:
+            return
+        dur = (time.monotonic() - self._t0) * 1000.0
+        ds = sorted(self._dts)
+        self._t0 = None
+        n = len(ds)
+        if not n:
+            return
+        p50 = ds[n // 2]
+        p95 = ds[min(n - 1, int(n * 0.95))]
+        over = sum(1 for d in ds if d > 20.0)
+        print(
+            f"[omatv][anim] {self._label} motion={dur:.0f}ms start="
+            f"{self._start_ms if self._start_ms is not None else -1:.0f}ms "
+            f"frames={n} p50={p50:.1f}ms p95={p95:.1f}ms max={ds[-1]:.1f}ms "
+            f"over20ms={over}",
+            flush=True,
+        )
+
+
 _T0 = time.monotonic()
 
 # Every stream — tiles and the watch view alike — is loaded at SOURCE quality.
@@ -61,46 +139,70 @@ def ease_out_cubic(t):
     return 1.0 - t * t * t
 
 
-# One motion language for the whole app.
+# One motion language for the whole app. The cadence is the frame clock, so
+# there is no fixed frame interval any more: motion is timed in wall clock ms.
 MOTION_MS = 300
-FRAME_MS = 16
+
+
+class _Job:
+    """One running tween: a deadline plus two callbacks."""
+
+    __slots__ = ("key", "t0", "dur", "step", "done", "label")
+
+    def __init__(self, key, dur_ms, step, done, label):
+        self.key = key
+        self.t0 = time.monotonic()
+        self.dur = max(0.001, dur_ms / 1000.0)
+        self.step = step
+        self.done = done
+        self.label = label
+
+    def t(self, now):
+        return min(1.0, (now - self.t0) / self.dur)
 
 
 class Anim:
-    """Per-owner tween registry. A later tween on the same key wins."""
+    """Per-owner tween registry, driven by ONE frame-clock callback.
 
-    def __init__(self, owner):
+    The previous engine gave every job its own 16 ms GLib timeout and advanced a
+    step counter, so (a) a reflow of N tiles meant N timers firing inside the
+    same frame, and (b) a slow frame still consumed only one step, which
+    stretched the animation past MOTION_MS exactly when the machine was busy: a
+    nominal 300 ms reflow measured 400-860 ms with real players on screen, a
+    third of its frames late. Motion is wall clock now, so a slow frame is
+    skipped rather than accumulated, and one tick drives every job.
+    """
+
+    def __init__(self, owner, widget):
         self.owner = owner
+        self.widget = widget        # any mapped widget: the frame clock source
         self._jobs = {}
+        self._tid = None
+        self._idle = []
+        self._probe = FrameProbe()
 
+    # ---- public API (unchanged for callers) -----------------------------
     def cancel(self, key):
-        sid = self._jobs.pop(key, None)
-        if sid is not None:
-            try:
-                GLib.source_remove(sid)
-            except Exception:
-                pass
+        if self._jobs.pop(key, None) is None:
+            return
+        if not self._jobs:
+            self._stop()
 
     def cancel_all(self):
-        for key in list(self._jobs):
-            self.cancel(key)
+        if not self._jobs:
+            return
+        self._jobs.clear()
+        self._stop()
 
-    def _run(self, key, steps, on_step, on_done, label):
-        state = {"i": 0}
+    def busy(self):
+        return bool(self._jobs)
 
-        def tick():
-            state["i"] += 1
-            t = min(1.0, state["i"] / steps)
-            on_step(ease_out_cubic(t), state["i"], steps)
-            if state["i"] >= steps:
-                self._jobs.pop(key, None)
-                if on_done:
-                    on_done()
-                dbg(f"tween done key={key} {label}")
-                return False
-            return True
-
-        self._jobs[key] = GLib.timeout_add(FRAME_MS, tick)
+    def on_idle(self, cb):
+        """Run cb once, after every job running right now has finished."""
+        if not self._jobs:
+            cb()
+        else:
+            self._idle.append(cb)
 
     def rect(self, key, start, end, on_step, on_done=None, label=""):
         start = tuple(start)
@@ -110,36 +212,34 @@ class Anim:
             if on_done:
                 on_done()
             return
-        steps = max(10, int(round(MOTION_MS / FRAME_MS)))
-        self.cancel(key)
         dbg(
             f"tween start key={key} from={fmt_rect(start)} to={fmt_rect(end)} "
-            f"steps={steps} dur={MOTION_MS} {label}"
+            f"dur={MOTION_MS} {label}"
         )
 
-        def step(e, i, n):
+        def step(e):
             r = tuple(int(round(a + (b - a) * e)) for a, b in zip(start, end))
             on_step(r)
-            dbg(f"tween step key={key} {i}/{n} rect={fmt_rect(r)} {label}")
+            if UI_DEBUG:
+                # Never format a debug string per frame when debug is off.
+                dbg(f"tween step key={key} rect={fmt_rect(r)} {label}")
 
         def done():
             on_step(end)
             if on_done:
                 on_done()
 
-        self._run(key, steps, step, done, label)
+        self._add(key, MOTION_MS, step, done, label)
 
     def fade(self, key, widget, a0, a1, on_done=None, label=""):
-        steps = max(10, int(round(MOTION_MS / FRAME_MS)))
         if abs(a1 - a0) < 0.001:
             widget.set_opacity(a1)
             if on_done:
                 on_done()
             return
-        self.cancel(key)
-        dbg(f"fade start key={key} {a0:.2f}->{a1:.2f} steps={steps} {label}")
+        dbg(f"fade start key={key} {a0:.2f}->{a1:.2f} {label}")
 
-        def step(e, i, n):
+        def step(e):
             widget.set_opacity(a0 + (a1 - a0) * e)
 
         def done():
@@ -147,7 +247,70 @@ class Anim:
             if on_done:
                 on_done()
 
-        self._run(key, steps, step, done, label)
+        self._add(key, MOTION_MS, step, done, label)
+
+    # ---- engine ---------------------------------------------------------
+    def _add(self, key, dur_ms, step, done, label):
+        if not self._jobs:
+            self._probe.begin(label)
+        self._jobs[key] = _Job(key, dur_ms, step, done, label)
+        self._start()
+
+    def _start(self):
+        if self._tid is not None:
+            return
+        self._tid = self.widget.add_tick_callback(self._tick)
+        # Safety net. A tick callback does not fire while the widget is unmapped
+        # or the window is occluded; measured in a nested compositor a motion
+        # stalled 140-340 ms with jobs still alive, and anything waiting on them
+        # (the deferred player sync, dropping a departed tile) waits too. This
+        # repeats while jobs are alive and force-finishes anything past its
+        # deadline, so a motion can never be left visually stuck mid-way.
+        GLib.timeout_add(100, self._safety)
+
+    def _tick(self, widget, clock):
+        now = time.monotonic()
+        self._probe.frame(now)
+        for key, job in list(self._jobs.items()):
+            if self._jobs.get(key) is not job:
+                continue                    # a callback replaced it
+            t = job.t(now)
+            if t >= 1.0:
+                self._jobs.pop(key, None)
+                job.done()
+                if UI_DEBUG:
+                    dbg(f"tween done key={key} {job.label}")
+            else:
+                job.step(ease_out_cubic(t))
+        if self._jobs:
+            return GLib.SOURCE_CONTINUE
+        self._tid = None
+        self._finish_idle()
+        return GLib.SOURCE_REMOVE
+
+    def _safety(self):
+        now = time.monotonic()
+        for key, job in list(self._jobs.items()):
+            if job.t(now) >= 1.0:
+                self._jobs.pop(key, None)
+                job.done()
+        if not self._jobs:
+            self._stop()
+            self._finish_idle()
+            return False
+        return True
+
+    def _stop(self):
+        if self._tid is not None:
+            self.widget.remove_tick_callback(self._tid)
+            self._tid = None
+
+    def _finish_idle(self):
+        self._probe.end()
+        cbs, self._idle = self._idle, []
+        for cb in cbs:
+            cb()
+
 
 
 HOME_CSS = b"""
@@ -339,10 +502,11 @@ class HomePage:
         self.scroller = scroller
         self.tiles = {}
         self.order = []
-        self.anim = Anim(self)
+        self.anim = Anim(self, surface)
         self._active = False
         self.mode = "home"
         self._sync_timer = None
+        self._sync_deferred = False
         self._reflow_timer = None
         self._install_css()
 
@@ -474,10 +638,28 @@ class HomePage:
             if not tile.mapped_ok():
                 tile.place(target)
             elif motion and tuple(tile.rect) != tuple(target):
-                self.anim.rect(
-                    f"cell-{tile.uid}", tile.rect, target,
-                    lambda r, t=tile: t.place(r), label=f"reflow {tile.login}",
-                )
+                if tuple(tile.rect[2:]) == tuple(target[2:]):
+                    # Same-size cell change is a pure MOVE: never touch a size
+                    # request for it, because re-allocating the tile's GLArea
+                    # makes mpv rebuild its render target every frame, measured
+                    # as the worst frame-gap case of any motion here.
+                    self.anim.rect(
+                        f"cell-{tile.uid}", tile.rect, target,
+                        lambda r, t=tile: t.move_to(r[0], r[1]),
+                        label=f"reflow {tile.login}",
+                    )
+                elif SNAP_RESIZE:
+                    tile.snap_size(target)
+                    self.anim.rect(
+                        f"cell-{tile.uid}", tile.rect, target,
+                        lambda r, t=tile: t.move_to(r[0], r[1]),
+                        label=f"reflow {tile.login}",
+                    )
+                else:
+                    self.anim.rect(
+                        f"cell-{tile.uid}", tile.rect, target,
+                        lambda r, t=tile: t.place(r), label=f"reflow {tile.login}",
+                    )
             elif tuple(tile.rect) != tuple(target):
                 tile.place(target)
         for tile in arriving:
@@ -517,9 +699,25 @@ class HomePage:
 
     # ---- viewport-driven playback -------------------------------------
     def _queue_sync(self):
-        if self._sync_timer:
+        """Start/stop tile players, at most once, once the motion is over.
+
+        _sync_players picks the tiles to run from their CURRENT rects and can
+        spawn a streamlink child per entering tile, which is CPU and I/O heavy:
+        doing that 60 ms into a 300 ms tween is what turned a rearrangement into
+        a stutter. It also read half-tweened rects, so deferring is more correct
+        as well as smoother.
+        """
+        if self._sync_timer or self._sync_deferred:
+            return
+        if self.anim.busy():
+            self._sync_deferred = True
+            self.anim.on_idle(self._sync_pending)
             return
         self._sync_timer = GLib.timeout_add(60, self._sync_players)
+
+    def _sync_pending(self):
+        self._sync_deferred = False
+        self._queue_sync()
 
     def set_mode(self, mode):
         self.mode = mode
@@ -888,10 +1086,41 @@ class Tile(Gtk.Overlay):
     def mapped_ok(self):
         return self.rect[2] > 0 and self.rect[3] > 0
 
-    def place(self, rect):
-        self.rect = tuple(int(v) for v in rect)
-        x, y, w, h = self.rect
+    def snap_size(self, rect):
+        """Take the target SIZE now, keep the current position.
+
+        Paired with a position-only tween this pays the GLArea re-allocation and
+        the mpv render-target rebuild ONCE for a column change instead of once
+        per animated frame.
+        """
+        w, h = int(rect[2]), int(rect[3])
+        if (w, h) == (self.rect[2], self.rect[3]):
+            return
+        self.rect = (self.rect[0], self.rect[1], w, h)
         self.set_size_request(max(1, w), max(1, h))
+
+    def move_to(self, x, y):
+        """Position-only move: never touches a size request.
+
+        A Gtk.GLArea re-allocated mid-tween makes mpv rebuild its render
+        target, which is the most expensive thing that can happen per frame per
+        tile, and a pure cell shift does not need it.
+        """
+        x, y = int(x), int(y)
+        if (x, y) == (self.rect[0], self.rect[1]):
+            return
+        self.rect = (x, y, self.rect[2], self.rect[3])
+        self.page.surface.move(self, x, y)
+
+    def place(self, rect):
+        rect = tuple(int(v) for v in rect)
+        if rect == self.rect:
+            return
+        x, y, w, h = rect
+        resized = (w, h) != (self.rect[2], self.rect[3])
+        self.rect = rect
+        if resized:
+            self.set_size_request(max(1, w), max(1, h))
         self.page.surface.move(self, x, y)
 
     def update_info(self, info):
