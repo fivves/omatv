@@ -109,9 +109,10 @@ Twitch IRC (WebSocket) ──► WebKit webview (chat/chat.js)
   anchoring, so playback starts at the live edge instead of 3 segments back.
 - **Grid and watch view share one surface:** the tiles and the grown player
   live on a single `Gtk.Fixed` inside a scroller, so selecting a channel moves
-  the running player rather than creating a second one. Tiles software-decode
-  and mute at construction; a grid of hardware-decoding players can crash
-  inside ffmpeg's Vulkan probe.
+  the running player rather than creating a second one. Tiles mute at
+  construction and request an explicit hwaccel mode (`OMATV_TILE_HWDEC`,
+  default `vaapi`) rather than `auto-safe`, whose ffmpeg Vulkan-extension probe
+  can crash when a whole grid of players enumerates Vulkan at once.
 - **Chat:** a WebKit webview loads `chat/chat.html` + `chat.js`, which connect
   directly to Twitch IRC over WebSocket. A Python bridge (`window.webkit.
   messageHandlers.omatv.postMessage`) handles fetches that need the OAuth
