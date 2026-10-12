@@ -308,6 +308,27 @@ def download_avatar(user_id, url):
     return path
 
 
+def order_rail(rail, order):
+    """Rearrange `rail`'s children into `order` (left to right).
+
+    Gtk.Box has no "move child to index" call, so the sequence is rebuilt with
+    reorder_child_after: walking left to right and anchoring each button to its
+    predecessor lands the exact order. The widgets are never recreated, and a
+    button that is already in place is not touched, so this is safe to run on
+    every refresh.
+    """
+    prev = None
+    for child in order:
+        if child.get_parent() is rail:
+            if rail.get_first_child() is child and prev is None:
+                prev = child
+                continue
+            rail.reorder_child_after(child, prev)
+        else:
+            rail.append(child)
+        prev = child
+
+
 class StreamerButton(Gtk.Button):
     def __init__(self, info):
         super().__init__()
@@ -345,6 +366,9 @@ class StreamerButton(Gtk.Button):
         overlay.add_overlay(self.live_dot_rev)
 
         self.set_child(overlay)
+        # Set once a real avatar image replaces the letter placeholder; the
+        # state class has to follow whichever widget is actually visible.
+        self._avatar_pic = None
         self._apply_live(False)
 
     def set_avatar_texture(self, texture):
@@ -356,6 +380,10 @@ class StreamerButton(Gtk.Button):
         self.avatar.set_visible(False)
         overlay = self.get_child()
         overlay.set_child(pic)
+        # From here on the picture is what the user sees, so it is what carries
+        # the live/offline state too (see _apply_live).
+        self._avatar_pic = pic
+        self._apply_live(self.info.get("live", False))
 
     def set_state(self, live, game):
         self.info["live"] = live
@@ -368,10 +396,17 @@ class StreamerButton(Gtk.Button):
         )
 
     def _apply_live(self, live):
-        child = self.avatar
-        child.remove_css_class("offline")
-        child.remove_css_class("live")
-        child.add_css_class("live" if live else "offline")
+        # Apply the state class to the avatar the user actually SEES. Once a
+        # real avatar downloads, set_avatar_texture hides the letter label and
+        # installs a Gtk.Picture on top, so styling only the label left every
+        # offline channel looking live: the rail never showed a channel going
+        # offline (Eddie, Oct 11 2026).
+        for child in (self.avatar, self._avatar_pic):
+            if child is None:
+                continue
+            child.remove_css_class("offline")
+            child.remove_css_class("live")
+            child.add_css_class("live" if live else "offline")
 
 
 class VideoArea(Gtk.GLArea):
@@ -603,6 +638,9 @@ class OmatvWindow(Adw.ApplicationWindow):
         self.api = api
         self.streamers = {}
         self.buttons = {}
+        # Display order of the rail buttons (live first, offline pooled right).
+        # Kept so a 60s refresh only reorders when the sequence really changed.
+        self._rail_order = []
         self.current_channel = None
         self.current_display_name = None
         self.resolve_gen = 0
@@ -2206,12 +2244,24 @@ class OmatvWindow(Adw.ApplicationWindow):
                 except Exception:
                     pass
 
+        # Rail ORDER: live channels left, offline pooled right. refresh_follows
+        # hands the list over already sorted live-first, so the rail follows it.
+        # Before this, buttons were only ever APPENDED, which froze the order at
+        # launch: a channel that went offline kept its slot forever and the top
+        # bar never looked like it had refreshed (Eddie, Oct 11 2026).
+        order = [self.buttons[i["id"]] for i in infos if i["id"] in self.buttons]
+        moved = order != self._rail_order
+        if moved:
+            order_rail(self.rail, order)
+            self._rail_order = order
+
         sig = hashlib.sha1(
             ",".join(str(id(b)) for b in self.buttons.values()).encode()
         ).hexdigest()[:12]
         home.dbg(
             f"rail apply: n={len(self.buttons)} sig={sig} "
-            f"added={len(added)} removed={len(removed)}"
+            f"added={len(added)} removed={len(removed)} reordered={moved} "
+            f"live={sum(1 for b in order if b.info.get('live'))}"
         )
 
         # Drive the home grid from the same 60s follows refresh.
@@ -2220,8 +2270,13 @@ class OmatvWindow(Adw.ApplicationWindow):
     def start_loops(self):
         def loop():
             while True:
-                self.refresh_follows()
-                self.poll_stream_info()
+                try:
+                    self.refresh_follows()
+                    self.poll_stream_info()
+                except Exception as e:
+                    # NEVER let one bad cycle kill the refresher: a dead loop
+                    # froze the rail's live state until the app was restarted.
+                    print("follows loop error:", e)
                 time.sleep(60)
 
         threading.Thread(target=loop, daemon=True).start()
