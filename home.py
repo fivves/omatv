@@ -502,6 +502,11 @@ class HomePage:
         self.scroller = scroller
         self.tiles = {}
         self.order = []
+        # Channels opened by paste-to-watch are not followed, so the 60s
+        # follows refresh does not know about them. Their cids are protected
+        # here until the channel is left again, otherwise update() would evict
+        # the tile mid-watch and take the player down with it.
+        self.pinned = set()
         self.anim = Anim(self, surface)
         self._active = False
         self.mode = "home"
@@ -563,21 +568,68 @@ class HomePage:
 
         removed = []
         for cid in list(self.tiles):
-            if cid not in seen:
-                tile = self.tiles.pop(cid)
-                if cid in self.order:
-                    self.order.remove(cid)
-                removed.append(tile)
-                dbg(
-                    f"grid membership remove channel={tile.login} cid={cid} "
-                    f"tile={tile.uid}"
-                )
+            if cid in seen or cid in self.pinned:
+                continue
+            tile = self.tiles[cid]
+            if self.win.is_watch_tile(tile):
+                # Never evict the tile that is grown into the watch video.
+                # Pulling a realized GLArea out of the surface unrealizes it
+                # and tears mpv down, so a followed channel that ended
+                # mid-watch would blank the screen instead of holding its last
+                # frame.
+                continue
+            self.tiles.pop(cid)
+            if cid in self.order:
+                self.order.remove(cid)
+            removed.append(tile)
+            dbg(
+                f"grid membership remove channel={tile.login} cid={cid} "
+                f"tile={tile.uid}"
+            )
 
-        self._set_count(len(seen))
-        self.win.set_home_empty(not seen)
+        self._set_count(len(self.tiles))
+        self.win.set_home_empty(not self.tiles)
 
         self._reflow(motion=True, departing=removed, arriving=new_tiles)
         self._queue_sync()
+
+    def add_pinned(self, info):
+        """Add a channel that is not followed as a temporary grid tile.
+
+        Paste-to-watch needs a real tile because a tile is what owns the
+        streamlink child and the mpv player; there is no tile-less player in
+        this app. The cid goes into self.pinned so update() leaves it alone on
+        the next follows refresh.
+        """
+        cid = info.get("id")
+        if not cid:
+            return None
+        tile = self.tiles.get(cid)
+        if tile is not None:
+            tile.update_info(info)
+            self.pinned.add(cid)
+            return tile
+        tile = Tile(self, info)
+        tile.set_opacity(0.0)
+        self.tiles[cid] = tile
+        self.order.append(cid)
+        self.pinned.add(cid)
+        self.surface.put(tile, 0, 0)
+        dbg(
+            f"grid guest add channel={info.get('login')} cid={cid} "
+            f"tile={tile.uid} player={tile.va.pid}"
+        )
+        self._reflow(motion=True, arriving=[tile])
+        self._set_count(len(self.tiles))
+        self.win.set_home_empty(False)
+        self._queue_sync()
+        return tile
+
+    def unpin(self, cid):
+        """Stop protecting a guest tile; the next refresh evicts it."""
+        if cid in self.pinned:
+            self.pinned.discard(cid)
+            dbg(f"grid guest unpin cid={cid}")
 
     def _set_count(self, n):
         btn = getattr(self.win, "home_btn", None)

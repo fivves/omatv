@@ -3,6 +3,7 @@ import ctypes
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -303,6 +304,30 @@ class TwitchAPI:
             "started_at": s.get("started_at", ""),
         }
 
+    def channel_info(self, login):
+        """Resolve a login into the info dict the grid uses, followed or not.
+
+        The grid builds these dicts in refresh_follows; paste-to-watch needs the
+        same shape for a channel that is not in the followed list. Returns None
+        when no such channel exists; `live` is False when it exists but is not
+        streaming.
+        """
+        cid = self.get_user_id(login)
+        if not cid:
+            return None
+        u = self.users([cid]).get(cid, {})
+        s = self.streams([cid]).get(cid)
+        return {
+            "id": cid,
+            "login": u.get("login") or login,
+            "name": u.get("display_name") or login,
+            "avatar": u.get("profile_image_url", ""),
+            "live": bool(s),
+            "viewers": s.get("viewer_count") if s else 0,
+            "game": s.get("game_name") if s else "",
+            "title": s.get("title") if s else "",
+        }
+
 
 def fetch_json(url):
     req = urllib.request.Request(url, headers={"User-Agent": "omatv/1.0"})
@@ -341,6 +366,71 @@ def order_rail(rail, order):
         else:
             rail.append(child)
         prev = child
+
+
+# First path segments of a twitch.tv URL that are never channel logins. A
+# pasted link must not be opened as a channel because it happened to parse.
+TWITCH_NON_CHANNEL = {
+    "about", "activate", "bits", "channel", "collections", "creatorcamp",
+    "directory", "download", "downloads", "drops", "friends", "following",
+    "inventory", "jobs", "legal", "login", "messages", "notifications", "p",
+    "privacy", "products", "purchases", "redeem", "search", "security",
+    "settings", "signup", "store", "subscriptions", "terms", "turbo", "videos",
+    "wallet",
+}
+
+LOGIN_RE = re.compile(r"^[a-z0-9_]{1,25}$")
+
+
+def _clean_login(value):
+    login = (value or "").strip().lower()
+    if not login or login in TWITCH_NON_CHANNEL:
+        return None
+    if not LOGIN_RE.match(login):
+        return None
+    return login
+
+
+def parse_twitch_login(text):
+    """Pull a channel login out of pasted text, or None if it is not a link.
+
+    Handles what the address bar or the share button gives you: twitch.tv/<login>
+    with any of www./m. and a trailing slash, query string or fragment;
+    player.twitch.tv/?channel=<login>; and /<login>/clip/<id> or /<login>/videos
+    (a clip link still names its channel). twitch.tv/videos/<id> names no channel
+    and is refused, as is anything that is not a twitch.tv URL.
+    """
+    if not text:
+        return None
+    raw = text.strip().strip("<>")
+    if not raw or len(raw) > 400:
+        return None
+    # A pasted line often carries the message around the link; take the token
+    # that holds the host rather than assuming the clipboard is only the URL.
+    tokens = raw.split()
+    raw = next((t for t in tokens if "twitch.tv" in t.lower()), None)
+    if raw is None:
+        return None
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        parts = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return None
+    host = (parts.netloc or "").lower().split(":")[0]
+    for prefix in ("www.", "m.", "go."):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+            break
+    if host == "player.twitch.tv":
+        q = urllib.parse.parse_qs(parts.query)
+        return _clean_login((q.get("channel") or [""])[0])
+    if host != "twitch.tv":
+        return None
+    segs = [s for s in parts.path.split("/") if s]
+    if not segs:
+        return None
+    return _clean_login(segs[0])
 
 
 class StreamerButton(Gtk.Button):
@@ -994,6 +1084,17 @@ class OmatvWindow(Adw.ApplicationWindow):
         action_quit.connect("activate", lambda *a: app.quit())
         self.add_action(action_quit)
         app.set_accels_for_action("win.quit", ["<Ctrl>q"])
+
+        # Hidden feature: paste a Twitch link on the home page to watch that
+        # channel whether or not you follow it. This is a key CONTROLLER, not an
+        # accelerator: an accel is dispatchable no matter which widget has
+        # focus, so Ctrl+V registered that way would steal the paste out of the
+        # chat composer. A controller runs in the bubble phase, so the focused
+        # widget (the WebView) still gets Ctrl+V first, and on_paste_key only
+        # consumes the event on the home page.
+        key_ctrl = Gtk.EventControllerKey()
+        key_ctrl.connect("key-pressed", self.on_paste_key)
+        self.add_controller(key_ctrl)
 
     # ---- responsive layout ------------------------------------------------
     def _content_size(self):
@@ -1871,6 +1972,118 @@ class OmatvWindow(Adw.ApplicationWindow):
         self._apply_layout()
         self._fetch_watch_info(login, name or login, channel_id)
 
+    # ---- hidden: paste a Twitch link to watch it (followed or not) ---------
+    def on_paste_key(self, ctrl, keyval, keycode, state):
+        """Ctrl+V on the home page opens a Twitch link from the clipboard."""
+        if keyval not in (Gdk.KEY_v, Gdk.KEY_V):
+            return False
+        if not (state & Gdk.ModifierType.CONTROL_MASK):
+            return False
+        # Leave Ctrl+Shift+V (paste plain) and Ctrl+Alt+V alone.
+        if state & (Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.ALT_MASK):
+            return False
+        return self.paste_watch()
+
+    def paste_watch(self):
+        """Read the clipboard and open a Twitch link, if that is what it holds.
+
+        Only fires on the home page, so this cannot interfere with pasting text
+        into the chat. Returns True when the key event was consumed.
+        """
+        if self.view != "home":
+            return False
+        display = Gdk.Display.get_default()
+        if display is None:
+            return False
+
+        def got(cb, res):
+            try:
+                text = cb.read_text_finish(res)
+            except Exception:
+                text = None
+            login = parse_twitch_login(text)
+            if login is None:
+                # Deliberately not logging the clipboard: it may hold a secret.
+                home.dbg(
+                    f"paste-watch: clipboard is not a Twitch link "
+                    f"(len={len(text or '')})"
+                )
+                return False
+            home.dbg(f"paste-watch: link -> login={login}")
+            self.watch_pasted_channel(login)
+            return False
+
+        display.get_clipboard().read_text_async(None, got)
+        return True
+
+    def watch_pasted_channel(self, login):
+        """Resolve a pasted login through Helix and open it, followed or not."""
+        login = (login or "").lower()
+        if not login:
+            return
+        self.flash_status(f"Looking up {login}…")
+
+        def work():
+            try:
+                info = self.api.channel_info(login)
+            except Exception as exc:
+                msg = f"Twitch API error: {exc}"
+                GLib.idle_add(lambda m=msg: (self.show_toast(m), False)[1])
+                return
+            GLib.idle_add(lambda i=info: (self.open_pasted_channel(i, login), False)[1])
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def open_pasted_channel(self, info, login):
+        """Open a resolved channel through the normal watch path.
+
+        A tile is what owns the streamlink child and the mpv player, so a
+        channel you do not follow still needs one; add_pinned makes it and
+        protects it from the 60s follows refresh. Selecting it is then the same
+        path a click on a followed tile takes, so chat, badges and emotes all
+        resolve off the channel id.
+        """
+        if info is None:
+            self.show_toast(f"No channel called {login} on Twitch")
+            return False
+        if not info.get("live"):
+            self.show_toast(f"{info.get('name') or login} is offline")
+            return False
+        if info.get("avatar"):
+            try:
+                info["local_avatar"] = download_avatar(info["id"], info["avatar"])
+            except Exception:
+                info["local_avatar"] = ""
+        tile = self.home_page.find_tile(login=info["login"], cid=info["id"])
+        if tile is None:
+            tile = self.home_page.add_pinned(info)
+        if tile is None:
+            self.show_toast("Could not open that channel")
+            return False
+        home.dbg(
+            f"paste-watch: open channel={info['login']} cid={info['id']} "
+            f"tile={tile.uid}"
+        )
+        # A tile has no mpv player until its GLArea realizes, and _start_tile
+        # refuses to run without one, so wait for that rather than selecting a
+        # tile that cannot start. The grid realizes new tiles on the next
+        # layout pass, so this is a frame or two, not a stall.
+        self._select_when_ready(tile, 60)
+        return False
+
+    def _select_when_ready(self, tile, tries):
+        if tile.va.player is not None:
+            self.flash_status(f"Tuning in {tile.name}…")
+            self.select_tile(tile)
+            return False
+        if tries <= 0:
+            self.show_toast("Could not start that stream")
+            return False
+        GLib.timeout_add(
+            50, lambda: (self._select_when_ready(tile, tries - 1), False)[1]
+        )
+        return False
+
     def _fetch_watch_info(self, login, display, channel_id):
         gen = self.resolve_gen
 
@@ -1939,6 +2152,11 @@ class OmatvWindow(Adw.ApplicationWindow):
             self.home_page.set_tile_watch(tile, False)
             # shrink the live video back into its exact grid cell
             self.home_page.restore_tile(tile)
+            # A channel opened by paste-to-watch is a one-shot guest: stop
+            # protecting it so the next follows refresh takes it back out of
+            # the grid. Channels you actually follow were never pinned, so this
+            # is a no-op for them.
+            self.home_page.unpin(tile.cid)
         for cid in self.home_page.order:
             t = self.home_page.tiles.get(cid)
             if t is not None:
@@ -2567,6 +2785,16 @@ class OmatvApp(Adw.Application):
                 GLib.timeout_add(12000, win._debug_sweep)
             if os.environ.get("OMATV_UI_SCRIPT") == "1":
                 GLib.timeout_add(2000, win._debug_script)
+            # Drive the hidden paste-to-watch path with a login or URL, for
+            # testing: OMATV_PASTE_TEST=somechannel python3 main.py
+            if os.environ.get("OMATV_PASTE_TEST"):
+                GLib.timeout_add_seconds(
+                    6,
+                    lambda: (
+                        win.watch_pasted_channel(os.environ["OMATV_PASTE_TEST"]),
+                        False,
+                    )[1],
+                )
         win.present()
 
 
