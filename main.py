@@ -951,6 +951,9 @@ class OmatvWindow(Adw.ApplicationWindow):
         # the revealer's alignment/transition, so it must be tracked, not just
         # derived: the alignment only has to change when the dock really moves.
         self._chat_mode = None
+        # The stream's own aspect once mpv reports one; the stacked dock sizes
+        # the video area from it so the picture fills the width with no bars.
+        self.stream_aspect = STREAM_ASPECT
         self.watch_tile = None
         self.watch_channel = None
         self.watch_display = None
@@ -1013,44 +1016,76 @@ class OmatvWindow(Adw.ApplicationWindow):
             return 0
         return max(CHAT_MIN_W, min(self.chat_width, maxw))
 
-    def effective_chat_height(self):
-        """Docked height of the stacked chat, or 0 when there is no room."""
+    def video_aspect(self):
+        """The aspect the video area has to match to show the picture with no
+        bars. The stream's own aspect once mpv has decoded a frame, 16:9 until
+        then (and for anything implausible)."""
+        a = getattr(self, "stream_aspect", 0) or STREAM_ASPECT
+        return a if 0.4 <= a <= 4.0 else STREAM_ASPECT
+
+    def video_picture_area(self, box_w, box_h):
+        """Area of the stream's picture letterboxed into a box of this size."""
+        if box_w <= 0 or box_h <= 0:
+            return 0.0
+        aspect = self.video_aspect()
+        pw = min(box_w, box_h * aspect)
+        return pw * (pw / aspect)
+
+    def _fraction_chat_height(self):
+        """Legacy fallback share of the height, used when a bar-free stacked
+        video would leave the chat less than its minimum."""
         _, h = self._content_size()
         maxh = h - VIDEO_MIN_H
         if maxh < CHAT_STACK_MIN_H:
             return 0
         return max(CHAT_STACK_MIN_H, min(int(round(h * CHAT_STACK_FRACTION)), maxh))
 
-    @staticmethod
-    def video_picture_area(box_w, box_h):
-        """Area of a 16:9 stream letterboxed into a box of this size."""
-        if box_w <= 0 or box_h <= 0:
-            return 0.0
-        pw = min(box_w, box_h * STREAM_ASPECT)
-        return pw * (pw / STREAM_ASPECT)
+    def stack_split(self):
+        """(video_h, chat_h, bar_free) for the dock under the video.
+
+        The video takes exactly the height the stream needs for the full width,
+        so the picture fills the area with no pillarbox bars, and the chat takes
+        everything that is left (Eddie, Oct 11 2026). When that would leave the
+        chat under CHAT_STACK_MIN_H there is no bar-free split to be had, so the
+        old fraction is used and the flag says the picture will be barred.
+        """
+        w, h = self._content_size()
+        vh = int(round(w / self.video_aspect()))
+        ch = h - vh
+        if ch >= CHAT_STACK_MIN_H:
+            return (max(1, vh), ch, True)
+        ch = self._fraction_chat_height()
+        return (max(1, h - ch), ch, False)
+
+    def effective_chat_height(self):
+        """Height of the chat when it is docked under the video (0 = no room)."""
+        return self.stack_split()[1]
 
     def chat_mode(self):
         """Where the chat docks at the current window size, or None for no room.
 
-        Whichever dock leaves the VIDEO the bigger picture wins. Judged on the
-        real 16:9 picture, not the box: a right-hand column in a tall window
-        hands the stream a narrow strip and wastes the rest of it as letterbox
-        bars (half of a 1920x1080 screen leaves the picture 601x338, while the
-        same window stacked gives 880x495). A tie keeps the column.
+        Whichever dock leaves the VIDEO the bigger picture wins, judged on the
+        real picture rather than the box: a right-hand column in a tall window
+        hands the stream a narrow strip and turns the rest of the height into
+        letterbox bars. The stacked dock only competes when it can give a
+        bar-free picture AND a usable chat; a stack that would have to clip the
+        video does not beat a column.
         """
         w, h = self._content_size()
         cw = self.effective_chat_width()
-        ch = self.effective_chat_height()
-        right_ok = cw > 0 and w - cw >= VIDEO_MIN_W
+        right_ok = cw > 0
+        vh, ch, bar_free = self.stack_split()
         bottom_ok = ch > 0
-        if right_ok and bottom_ok:
+        if bottom_ok and right_ok:
+            if not bar_free:
+                return "right"
             right_area = self.video_picture_area(w - cw, h)
-            bottom_area = self.video_picture_area(w, h - ch)
+            bottom_area = w * vh
             return "right" if right_area >= bottom_area else "bottom"
-        if right_ok:
-            return "right"
         if bottom_ok:
             return "bottom"
+        if right_ok:
+            return "right"
         return None
 
     def video_rect(self):
@@ -1069,8 +1104,8 @@ class OmatvWindow(Adw.ApplicationWindow):
             cw = self.effective_chat_width()
             return (0, 0, max(1, w - cw), max(1, h))
         if mode == "bottom":
-            ch = self.effective_chat_height()
-            return (0, 0, max(1, w), max(1, h - ch))
+            vh, _ch, _bar_free = self.stack_split()
+            return (0, 0, max(1, w), max(1, vh))
         return (0, 0, max(1, w), max(1, h))
 
     def _on_content_resize(self, *a):
@@ -1523,29 +1558,62 @@ class OmatvWindow(Adw.ApplicationWindow):
         """Show/hide the persistent mute badge from mpv's real mute state."""
         self.mute_badge.set_visible(bool(muted) and self.watch_player() is not None)
 
-    def _observe_watch_mute(self):
-        self._unobserve_watch_mute()
+    def on_stream_aspect(self, value):
+        """mpv reports the stream's real aspect from the first decoded frame.
+
+        The stacked dock sizes the video area from this so the picture fills the
+        width with no pillarbox bars, so a change (a 4:3 stream, a 21:9 one)
+        needs a fresh layout pass rather than waiting for a resize.
+        """
+        try:
+            aspect = float(value)
+        except (TypeError, ValueError):
+            return
+        if not (0.4 <= aspect <= 4.0):
+            return
+        if abs(aspect - self.stream_aspect) < 0.01:
+            return
+        home.dbg(f"stream aspect {aspect:.3f} (was {self.stream_aspect:.3f})")
+        self.stream_aspect = aspect
+        self._apply_layout(snap=True)
+        self.home_page._queue_reflow()
+
+    def _observe_watch_props(self):
+        """Watch what the picture reports for itself: mute state, and the
+        stream's aspect. Both only mean anything for the watch tile."""
+        self._unobserve_watch_props()
         player = self.watch_player()
         if player is None:
             return
 
-        def cb(_name, val):
+        def mute_cb(_name, val):
             GLib.idle_add(lambda: (self.on_mute_changed(bool(val)), False)[1])
 
+        def aspect_cb(_name, val):
+            GLib.idle_add(lambda: (self.on_stream_aspect(val), False)[1])
+
         try:
-            self._mute_observer = player.observe_property("mute", cb)
+            self._mute_observer = player.observe_property("mute", mute_cb)
         except Exception as e:
             print("watch mute observe failed:", e, flush=True)
             self._mute_observer = None
+        try:
+            self._aspect_observer = player.observe_property(
+                "video-params/aspect", aspect_cb
+            )
+        except Exception as e:
+            print("watch aspect observe failed:", e, flush=True)
+            self._aspect_observer = None
 
-    def _unobserve_watch_mute(self):
-        obs = getattr(self, "_mute_observer", None)
-        if obs is not None:
-            try:
-                obs.unobserve()
-            except Exception:
-                pass
-        self._mute_observer = None
+    def _unobserve_watch_props(self):
+        for attr in ("_mute_observer", "_aspect_observer"):
+            obs = getattr(self, attr, None)
+            if obs is not None:
+                try:
+                    obs.unobserve()
+                except Exception:
+                    pass
+            setattr(self, attr, None)
 
     def hide_mute_badge(self):
         self.mute_badge.set_visible(False)
@@ -1707,7 +1775,7 @@ class OmatvWindow(Adw.ApplicationWindow):
                 f"select {login}: old watch player LEAVE channel={prev_login} "
                 f"tile={prev_uid} player={prev_pid} (snap home + stop, same frame)"
             )
-        self._unobserve_watch_mute()
+        self._unobserve_watch_props()
 
         self.view = "watch"
         self.watch_tile = tile
@@ -1785,7 +1853,7 @@ class OmatvWindow(Adw.ApplicationWindow):
                 f"player={tile.va.pid} (EXISTING player grown; no new player/streamlink)"
             )
             self.home_page.set_tile_watch(tile, True)
-            self._observe_watch_mute()
+            self._observe_watch_props()
             self.home_page.grow_tile(tile, vr)
             for cid in list(self.home_page.order):
                 t = self.home_page.tiles.get(cid)
@@ -1861,7 +1929,7 @@ class OmatvWindow(Adw.ApplicationWindow):
         self.home_page.set_active(True)
         self.grid_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         self.grid_scroller.get_vadjustment().set_value(0)
-        self._unobserve_watch_mute()
+        self._unobserve_watch_props()
         self.watch_chrome.set_visible(False)
         self.hide_mute_badge()
         self.hide_status()
