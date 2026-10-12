@@ -55,6 +55,13 @@ VIDEO_MIN_H = 200          # never shrink the watch video below this
 CHAT_STACK_FRACTION = 0.45  # share of the content height the docked chat takes
 CHAT_STACK_MIN_H = 180      # below this a docked chat is not worth showing
 STREAM_ASPECT = 16 / 9      # what the video area is really judged on
+# A WebKitWebView reports its LAST ALLOCATION as its natural width. Once the
+# stacked dock has stretched it to the window width, that number is what the
+# side dock would size itself from, leaving the chat half the screen wide on top
+# of the video. The chat therefore lives inside an Adw.Clamp (the one container
+# that caps a child's natural width): the cap is the column width when the chat
+# is a side column, and effectively unlimited when it spans the bottom.
+CHAT_CLAMP_UNLIMITED = 100000
 CONFIG_CANDIDATES = [
     os.environ.get("OMATV_TWITCH_JSON", ""),
     os.path.expanduser("~/.config/twitch.json"),
@@ -903,7 +910,15 @@ class OmatvWindow(Adw.ApplicationWindow):
 
         # No drag handle: the chat width is fixed (see above).
         self.chat_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        self.chat_box.append(self.webview)
+        # The clamp is what makes the side dock's width authoritative; see the
+        # CHAT_CLAMP_UNLIMITED note at the top of the file.
+        self.chat_clamp = Adw.Clamp(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            maximum_size=CHAT_CLAMP_UNLIMITED,
+            tightening_threshold=CHAT_CLAMP_UNLIMITED,
+        )
+        self.chat_clamp.set_child(self.webview)
+        self.chat_box.append(self.chat_clamp)
 
         self.chat_revealer = Gtk.Revealer(
             transition_type=Gtk.RevealerTransitionType.SLIDE_RIGHT,
@@ -1089,19 +1104,44 @@ class OmatvWindow(Adw.ApplicationWindow):
             if mode == "bottom":
                 self.chat_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_UP)
                 self.chat_revealer.set_halign(Gtk.Align.FILL)
-                self.chat_revealer.set_valign(Gtk.Align.END)
+                # FILL, not END: the dock's height comes from margin_top below,
+                # so it never depends on the chat's natural size.
+                self.chat_revealer.set_valign(Gtk.Align.FILL)
                 # BOTH, and it matters: the box is the revealer's child, so it
                 # fills, but the WebView inside it keeps its own width request
                 # unless it expands too (measured: a 560px-wide dock with a
                 # 320px webview parked against the left edge).
                 self.chat_box.set_hexpand(True)
                 self.webview.set_hexpand(True)
+                self.chat_clamp.set_hexpand(True)
             else:
                 self.chat_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
                 self.chat_revealer.set_halign(Gtk.Align.END)
                 self.chat_revealer.set_valign(Gtk.Align.FILL)
                 self.chat_box.set_hexpand(False)
                 self.webview.set_hexpand(False)
+                self.chat_clamp.set_hexpand(False)
+        # Where the stacked dock starts, and how wide the column may be. Both
+        # are set from the numbers the layout wants rather than from the chat's
+        # own size request, because a WebKitWebView reports its LAST ALLOCATION
+        # as its natural size in BOTH axes: measured, a chat that had been
+        # 960px tall in fullscreen left a 900px-tall panel sitting over the
+        # video after leaving it.
+        top = max(0, h - self.effective_chat_height()) if mode == "bottom" else 0
+        if self.chat_revealer.get_margin_top() != top:
+            self.chat_revealer.set_margin_top(top)
+        cap = (
+            CHAT_CLAMP_UNLIMITED
+            if mode == "bottom"
+            else max(CHAT_MIN_W, self.effective_chat_width() or self.chat_width)
+        )
+        if self.chat_clamp.get_maximum_size() != cap:
+            if cap > self.chat_clamp.get_maximum_size():
+                self.chat_clamp.set_maximum_size(cap)
+                self.chat_clamp.set_tightening_threshold(cap)
+            else:
+                self.chat_clamp.set_tightening_threshold(cap)
+                self.chat_clamp.set_maximum_size(cap)
         open_chat = mode is not None
         if self.chat_revealer.get_reveal_child() != open_chat:
             self.chat_revealer.set_reveal_child(open_chat)
