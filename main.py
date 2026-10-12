@@ -47,7 +47,13 @@ TILE_HWDEC = os.environ.get("OMATV_TILE_HWDEC", "vaapi")
 # video pane it collapses to a toggleable pane that slides in from the right.
 CHAT_MIN_W = 320          # WebKitWebView measure minimum (hard floor)
 VIDEO_MIN_W = 360         # never shrink the watch video below this
-CHAT_COLLAPSE_W = CHAT_MIN_W + VIDEO_MIN_W + 24   # below this the chat auto-collapses
+CHAT_COLLAPSE_W = CHAT_MIN_W + VIDEO_MIN_W + 24   # narrower than this: dock the chat UNDER the video
+# Stacked (vertical) chat. A window too narrow to hold the chat beside the video
+# docks it under the video instead, spanning the full width: video on top, chat
+# across the bottom. Previously that case just dropped the chat entirely.
+VIDEO_MIN_H = 200          # never shrink the watch video below this
+CHAT_STACK_FRACTION = 0.45  # share of the content height the docked chat takes
+CHAT_STACK_MIN_H = 180      # below this a docked chat is not worth showing
 CONFIG_CANDIDATES = [
     os.environ.get("OMATV_TWITCH_JSON", ""),
     os.path.expanduser("~/.config/twitch.json"),
@@ -925,6 +931,10 @@ class OmatvWindow(Adw.ApplicationWindow):
 
         # ---- layout state ------------------------------------------------
         self.view = "home"
+        # Where the chat is docked right now: "right", "bottom" or None. Drives
+        # the revealer's alignment/transition, so it must be tracked, not just
+        # derived: the alignment only has to change when the dock really moves.
+        self._chat_mode = None
         self.watch_tile = None
         self.watch_channel = None
         self.watch_display = None
@@ -987,6 +997,26 @@ class OmatvWindow(Adw.ApplicationWindow):
             return 0
         return max(CHAT_MIN_W, min(self.chat_width, maxw))
 
+    def effective_chat_height(self):
+        """Docked height of the stacked chat, or 0 when there is no room."""
+        _, h = self._content_size()
+        maxh = h - VIDEO_MIN_H
+        if maxh < CHAT_STACK_MIN_H:
+            return 0
+        return max(CHAT_STACK_MIN_H, min(int(round(h * CHAT_STACK_FRACTION)), maxh))
+
+    def chat_mode(self):
+        """Where the chat docks at the current window size, or None for no room.
+
+        WIDE: a right-hand column beside the video. NARROW: under the video,
+        spanning the full width, so a skinny window keeps both panes instead of
+        dropping the chat (Eddie, Oct 11 2026).
+        """
+        w, _ = self._content_size()
+        if w >= CHAT_COLLAPSE_W:
+            return "right" if self.effective_chat_width() else None
+        return "bottom" if self.effective_chat_height() else None
+
     def video_rect(self):
         w, h = self._content_size()
         return (0, 0, max(1, w), max(1, h))
@@ -998,9 +1028,14 @@ class OmatvWindow(Adw.ApplicationWindow):
         the video is never asked for more than the content area provides.
         """
         w, h = self._content_size()
-        open_chat = self.chat_pref and self.chat_fits()
-        cw = self.effective_chat_width() if open_chat else 0
-        return (0, 0, max(1, w - cw), max(1, h))
+        mode = self.chat_mode() if (self.chat_pref and self.view == "watch") else None
+        if mode == "right":
+            cw = self.effective_chat_width()
+            return (0, 0, max(1, w - cw), max(1, h))
+        if mode == "bottom":
+            ch = self.effective_chat_height()
+            return (0, 0, max(1, w), max(1, h - ch))
+        return (0, 0, max(1, w), max(1, h))
 
     def _on_content_resize(self, *a):
         # The adjustment signals also fire when only the surface's extent
@@ -1023,19 +1058,42 @@ class OmatvWindow(Adw.ApplicationWindow):
 
     def _apply_layout(self, snap=False):
         w, h = self._content_size()
-        fits = self.chat_fits()
-        open_chat = self.chat_pref and fits and self.view == "watch"
-        cw = self.effective_chat_width() if open_chat else 0
-        if cw == 0:
-            open_chat = False
-        if self.chat_revealer.get_reveal_child() != bool(cw):
-            self.chat_revealer.set_reveal_child(bool(cw))
-        if cw:
-            self.webview.set_size_request(max(CHAT_MIN_W, cw), -1)
+        mode = self.chat_mode() if (self.chat_pref and self.view == "watch") else None
+        if mode != self._chat_mode:
+            # The dock changes side with the window shape, and the panel slides
+            # in from the side it lives on, so alignment and transition move
+            # together and BEFORE the revealer is asked to show anything.
+            self._chat_mode = mode
+            home.dbg(f"chat dock: {mode}")
+            if mode == "bottom":
+                self.chat_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_UP)
+                self.chat_revealer.set_halign(Gtk.Align.FILL)
+                self.chat_revealer.set_valign(Gtk.Align.END)
+                # BOTH, and it matters: the box is the revealer's child, so it
+                # fills, but the WebView inside it keeps its own width request
+                # unless it expands too (measured: a 560px-wide dock with a
+                # 320px webview parked against the left edge).
+                self.chat_box.set_hexpand(True)
+                self.webview.set_hexpand(True)
+            else:
+                self.chat_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
+                self.chat_revealer.set_halign(Gtk.Align.END)
+                self.chat_revealer.set_valign(Gtk.Align.FILL)
+                self.chat_box.set_hexpand(False)
+                self.webview.set_hexpand(False)
+        open_chat = mode is not None
+        if self.chat_revealer.get_reveal_child() != open_chat:
+            self.chat_revealer.set_reveal_child(open_chat)
+        if mode == "right":
+            self.webview.set_size_request(max(CHAT_MIN_W, self.effective_chat_width()), -1)
+        elif mode == "bottom":
+            # Full width, held at exactly this height: the height request is
+            # what keeps the dock at its share of the window.
+            self.webview.set_size_request(CHAT_MIN_W, self.effective_chat_height())
         # keep the toggle's visual state in sync without recursing
-        if self.chat_btn.get_active() != bool(open_chat):
+        if self.chat_btn.get_active() != open_chat:
             self._chat_btn_guard = True
-            self.chat_btn.set_active(bool(open_chat))
+            self.chat_btn.set_active(open_chat)
             self._chat_btn_guard = False
         # the grown tile / chrome fill the video rect on the watch view
         vr = self._full_video_rect()
@@ -1838,14 +1896,17 @@ class OmatvWindow(Adw.ApplicationWindow):
                 cw = self._content_size()[0]
                 fits = self.chat_fits()
                 ecw = self.effective_chat_width()
-                open_chat = self.chat_pref and fits and self.view == "watch"
+                ech = self.effective_chat_height()
+                open_chat = self.chat_pref and self.view == "watch" and self.chat_mode()
                 cols, cells = self.home_page._compute_cells()
                 tile_w = next(iter(cells.values()))[2] if cells else 0
                 clipped = cw > W + 1
                 home.dbg(
                     f"SWEEP width={W} content={cw} window_min={wmin} ok={wmin <= W} "
                     f"clipped={clipped} chat_fits={fits} "
-                    f"chat_w={ecw if open_chat else 0} collapsed={not open_chat} "
+                    f"chat_w={ecw if open_chat == 'right' else 0} "
+                    f"chat_h={ech if open_chat == 'bottom' else 0} "
+                    f"dock={open_chat or 'closed'} "
                     f"cols={cols} tile_w={tile_w}"
                 )
                 GLib.timeout_add(160, run, i + 1)
