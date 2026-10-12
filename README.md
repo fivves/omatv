@@ -29,6 +29,9 @@ latency**.
 - **Follows rail** — clickable avatars of everyone you follow, live/offline
   state, viewer count, game, and title on hover.
 - **Tab completion** — `@name` user mentions and emote completion while typing.
+- **Watch a pasted link** — `Ctrl+V` on the home grid opens the twitch.tv
+  channel in your clipboard, whether or not you follow it. Non-channel Twitch
+  URLs (`/videos/`, `/directory`, …) are refused rather than guessed at.
 - **Sign in with a paste** — no Twitch dev portal needed; get a token from
   [twitchtokengenerator.com](https://twitchtokengenerator.com/) and paste it in.
 
@@ -92,6 +95,10 @@ to watch — that tile becomes the full player, so switching channels does not
 restart a stream. Use the chat pane to talk; `@` opens user mention
 completion, Tab completes emotes, and right-clicking a message offers Reply or
 Copy message. The house button at the top of the rail returns to the grid.
+
+To watch something you don't follow, copy its twitch.tv link and press `Ctrl+V`
+on the grid — the channel opens as a guest tile. It's a one-shot: going back home
+forgets it again.
 
 ## How it works
 
