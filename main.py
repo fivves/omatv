@@ -54,6 +54,7 @@ CHAT_COLLAPSE_W = CHAT_MIN_W + VIDEO_MIN_W + 24   # narrower than this: dock the
 VIDEO_MIN_H = 200          # never shrink the watch video below this
 CHAT_STACK_FRACTION = 0.45  # share of the content height the docked chat takes
 CHAT_STACK_MIN_H = 180      # below this a docked chat is not worth showing
+STREAM_ASPECT = 16 / 9      # what the video area is really judged on
 CONFIG_CANDIDATES = [
     os.environ.get("OMATV_TWITCH_JSON", ""),
     os.path.expanduser("~/.config/twitch.json"),
@@ -1005,17 +1006,37 @@ class OmatvWindow(Adw.ApplicationWindow):
             return 0
         return max(CHAT_STACK_MIN_H, min(int(round(h * CHAT_STACK_FRACTION)), maxh))
 
+    @staticmethod
+    def video_picture_area(box_w, box_h):
+        """Area of a 16:9 stream letterboxed into a box of this size."""
+        if box_w <= 0 or box_h <= 0:
+            return 0.0
+        pw = min(box_w, box_h * STREAM_ASPECT)
+        return pw * (pw / STREAM_ASPECT)
+
     def chat_mode(self):
         """Where the chat docks at the current window size, or None for no room.
 
-        WIDE: a right-hand column beside the video. NARROW: under the video,
-        spanning the full width, so a skinny window keeps both panes instead of
-        dropping the chat (Eddie, Oct 11 2026).
+        Whichever dock leaves the VIDEO the bigger picture wins. Judged on the
+        real 16:9 picture, not the box: a right-hand column in a tall window
+        hands the stream a narrow strip and wastes the rest of it as letterbox
+        bars (half of a 1920x1080 screen leaves the picture 601x338, while the
+        same window stacked gives 880x495). A tie keeps the column.
         """
-        w, _ = self._content_size()
-        if w >= CHAT_COLLAPSE_W:
-            return "right" if self.effective_chat_width() else None
-        return "bottom" if self.effective_chat_height() else None
+        w, h = self._content_size()
+        cw = self.effective_chat_width()
+        ch = self.effective_chat_height()
+        right_ok = cw > 0 and w - cw >= VIDEO_MIN_W
+        bottom_ok = ch > 0
+        if right_ok and bottom_ok:
+            right_area = self.video_picture_area(w - cw, h)
+            bottom_area = self.video_picture_area(w, h - ch)
+            return "right" if right_area >= bottom_area else "bottom"
+        if right_ok:
+            return "right"
+        if bottom_ok:
+            return "bottom"
+        return None
 
     def video_rect(self):
         w, h = self._content_size()
