@@ -1086,9 +1086,6 @@ class Tile(Gtk.Overlay):
         # full-size player this information already lives in the top bar and
         # above the chat, and leaving it overlaid covers the video.
         self.top_box = top
-        self.avatar = Adw.Avatar.new(34, self.name, False)
-        self.avatar.set_show_initials(True)
-        top.append(self.avatar)
         spacer = Gtk.Box()
         spacer.set_hexpand(True)
         top.append(spacer)
@@ -1098,12 +1095,27 @@ class Tile(Gtk.Overlay):
         top.append(self.live_badge)
         self.add_overlay(top)
 
-        bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         bottom.add_css_class("tile-overlay")
         bottom.set_valign(Gtk.Align.END)
         # Same reason as top_box: the grid shows name/title/game/viewers, the
         # watch view already shows them in the top bar and above the chat.
         self.bottom_box = bottom
+        # The profile icon sits IN this row, to the left of the text, so it
+        # reads as the channel's avatar beside its name. It used to live in the
+        # top box on its own, which put it in the opposite corner from the text
+        # it belongs to. Centred rather than top-aligned: the text column is
+        # three lines tall (name / title / game+viewers), and a top-aligned
+        # 34px circle next to a ~55px column reads as a mistake.
+        self.avatar = Adw.Avatar.new(34, self.name, False)
+        self.avatar.set_show_initials(True)
+        self.avatar.set_valign(Gtk.Align.CENTER)
+        bottom.append(self.avatar)
+        # The text needs its own column: as direct children of the horizontal
+        # row the labels would sit side by side, and the ellipsize would never
+        # kick in. hexpand keeps the viewers label out at the right edge.
+        text_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        text_col.set_hexpand(True)
         self.name_lbl = Gtk.Label(label=self.name)
         self.name_lbl.add_css_class("tile-name")
         self.name_lbl.set_xalign(0.0)
@@ -1123,9 +1135,10 @@ class Tile(Gtk.Overlay):
         meta.append(self.game_lbl)
         meta.append(mspacer)
         meta.append(self.viewers_lbl)
-        bottom.append(self.name_lbl)
-        bottom.append(self.title_lbl)
-        bottom.append(meta)
+        text_col.append(self.name_lbl)
+        text_col.append(self.title_lbl)
+        text_col.append(meta)
+        bottom.append(text_col)
         self.add_overlay(bottom)
 
         click = Gtk.GestureClick(button=1)
