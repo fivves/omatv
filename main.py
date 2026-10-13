@@ -55,6 +55,7 @@ CHAT_COLLAPSE_W = CHAT_MIN_W + VIDEO_MIN_W + 24   # narrower than this: dock the
 VIDEO_MIN_H = 200          # never shrink the watch video below this
 CHAT_STACK_FRACTION = 0.45  # share of the content height the docked chat takes
 CHAT_STACK_MIN_H = 180      # below this a docked chat is not worth showing
+CHAT_SIDE_MIN_W = 200       # narrowest the chat column goes to keep the video bar-free
 STREAM_ASPECT = 16 / 9      # what the video area is really judged on
 # A WebKitWebView reports its LAST ALLOCATION as its natural width. Once the
 # stacked dock has stretched it to the window width, that number is what the
@@ -1111,11 +1112,8 @@ class OmatvWindow(Adw.ApplicationWindow):
         return w >= CHAT_COLLAPSE_W
 
     def effective_chat_width(self):
-        w, _ = self._content_size()
-        maxw = max(0, w - VIDEO_MIN_W)
-        if maxw < CHAT_MIN_W:
-            return 0
-        return max(CHAT_MIN_W, min(self.chat_width, maxw))
+        """Width of the chat when it is docked beside the video (0 = no room)."""
+        return self.side_split()[1]
 
     def video_aspect(self):
         """The aspect the video area has to match to show the picture with no
@@ -1161,6 +1159,33 @@ class OmatvWindow(Adw.ApplicationWindow):
     def effective_chat_height(self):
         """Height of the chat when it is docked under the video (0 = no room)."""
         return self.stack_split()[1]
+
+    def side_split(self):
+        """(video_w, chat_w, bar_free) for the dock beside the video.
+
+        The mirror of stack_split, and the fix for the same complaint on the
+        other axis (Eddie, Oct 12 2026): the video takes exactly the width the
+        stream needs for its full height, so the picture fills its area with no
+        bars, and the chat takes everything that is left. A fixed 340px column
+        was the problem: 1896x900 of content with a 16:9 stream left a 1556x900
+        box for a 1556x875 picture, i.e. 25px of black, and the mismatch gets
+        far worse for a narrow or an ultrawide stream.
+
+        When the leftover is under CHAT_SIDE_MIN_W there is no bar-free split
+        with a chat worth reading (the WebView's own minimum is 0, measured, but
+        a 150px chat is not usable), so the user's width is used and the flag
+        says the picture will be barred.
+        """
+        w, h = self._content_size()
+        vw = int(round(h * self.video_aspect()))
+        cw = w - vw
+        if cw >= CHAT_SIDE_MIN_W:
+            return (max(1, vw), cw, True)
+        maxw = max(0, w - VIDEO_MIN_W)
+        if maxw < CHAT_MIN_W:
+            return (max(1, w), 0, False)
+        cw = max(CHAT_MIN_W, min(self.chat_width, maxw))
+        return (max(1, w - cw), cw, False)
 
     def chat_mode(self):
         """Where the chat docks at the current window size, or None for no room.
@@ -1269,7 +1294,7 @@ class OmatvWindow(Adw.ApplicationWindow):
         cap = (
             CHAT_CLAMP_UNLIMITED
             if mode == "bottom"
-            else max(CHAT_MIN_W, self.effective_chat_width() or self.chat_width)
+            else max(1, self.effective_chat_width() or self.chat_width)
         )
         if self.chat_clamp.get_maximum_size() != cap:
             if cap > self.chat_clamp.get_maximum_size():
@@ -1282,7 +1307,9 @@ class OmatvWindow(Adw.ApplicationWindow):
         if self.chat_revealer.get_reveal_child() != open_chat:
             self.chat_revealer.set_reveal_child(open_chat)
         if mode == "right":
-            self.webview.set_size_request(max(CHAT_MIN_W, self.effective_chat_width()), -1)
+            # The chat's own minimum is 0 (measured), so a column narrower than
+            # CHAT_MIN_W is fine when that is what keeps the video bar-free.
+            self.webview.set_size_request(max(1, self.effective_chat_width()), -1)
         elif mode == "bottom":
             # Full width, held at exactly this height: the height request is
             # what keeps the dock at its share of the window.
