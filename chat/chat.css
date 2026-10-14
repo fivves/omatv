@@ -100,6 +100,36 @@ body {
   color: var(--accent);
 }
 
+/* Icon-only status pills: an eye stands in for "watching", a dot for "live".
+   The number is the only text left, because the words were the widest part of
+   the header. Icons are CSS masks on ::before so the JS stays text-only and
+   keeps repainting a plain number twice a second. */
+#viewers.live-viewers,
+.conn.live {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+#viewers.live-viewers::before {
+  content: "";
+  flex: none;
+  width: 13px;
+  height: 13px;
+  background: currentColor;
+  -webkit-mask-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill-rule='evenodd' d='M12 5C6.6 5 2.4 8.6 1 12c1.4 3.4 5.6 7 11 7s9.6-3.6 11-7c-1.4-3.4-5.6-7-11-7Zm0 10.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z'/></svg>");
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  -webkit-mask-size: contain;
+}
+.conn.live::before {
+  content: "";
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
 #msgs {
   flex: 1;
   overflow-y: auto;

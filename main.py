@@ -29,6 +29,38 @@ CACHE = os.path.expanduser("~/.cache/omatv")
 AVATAR_DIR = os.path.join(CACHE, "avatars")
 SETTINGS_PATH = os.path.expanduser("~/.config/omatv/settings.json")
 DEFAULT_CHAT_WIDTH = 340
+
+# The chat page owns its own palette (chat.css :root). Its background follows
+# the GTK theme instead of being hardcoded: this file is the palette the running
+# Omarchy theme actually paints GTK apps with (gtk-theme-colors rewrites it on
+# every theme change, and gtk.css imports it), and the two panel shades keep the
+# +7/+13 lift the chat's panels always had over its own background.
+CHAT_THEME_FILE = os.path.join(
+    os.path.expanduser("~"), ".config", "gtk-4.0", "omarchy-theme.css")
+CHAT_THEME_KEY = "window-bg-color"
+CHAT_THEME_FALLBACK = "#131317"
+CHAT_PANEL_LIFT = (7, 13)
+
+
+def read_theme_palette(path=CHAT_THEME_FILE):
+    """{name: '#rrggbb'} from the palette's :root block, {} if unreadable."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return {}
+    return {name: val for name, val in
+            re.findall(r"--([a-z0-9-]+):\s*(#[0-9A-Fa-f]{6})\s*;", text)}
+
+
+def lift_hex(color, delta):
+    """#rrggbb with delta added per channel, clamped (bad input -> fallback)."""
+    if not re.fullmatch(r"#[0-9A-Fa-f]{6}", color or ""):
+        return CHAT_THEME_FALLBACK
+    return "#%02x%02x%02x" % tuple(
+        max(0, min(255, int(color[i:i + 2], 16) + delta)) for i in (1, 3, 5))
+
+
 # Deferral for the single-click mute so the first half of a double-click
 # doesn't mute before the fullscreen. Keep this short for a snappy mute;
 # double-clicks slower than this will mute first.
@@ -1376,6 +1408,66 @@ class OmatvWindow(Adw.ApplicationWindow):
         home.dbg("cleanup: all tile streamlinks killed, all players stopped")
         return False
 
+    def chat_theme_vars(self):
+        """The chat page's background variables, taken from the GTK theme.
+
+        The theme's own window background becomes the chat background, and the
+        two panel shades are lifted from it by the same amounts the chat's
+        hardcoded panels used, so the layout keeps its hierarchy while the hue
+        follows whatever theme is active.
+        """
+        base = read_theme_palette().get(CHAT_THEME_KEY) or CHAT_THEME_FALLBACK
+        return {
+            "--bg": base,
+            "--panel": lift_hex(base, CHAT_PANEL_LIFT[0]),
+            "--panel-2": lift_hex(base, CHAT_PANEL_LIFT[1]),
+        }
+
+    def apply_chat_theme(self):
+        """Push the current theme's surfaces into the chat page and its WebView.
+
+        Runs at startup, again from the page's own "ready" handshake (before
+        that the WebView has no document to set variables on), and whenever the
+        palette file changes.
+        """
+        colors = self.chat_theme_vars()
+        try:
+            rgba = Gdk.RGBA()
+            rgba.parse(colors["--bg"])
+            self.webview.set_background_color(rgba)
+        except Exception:
+            pass
+        if not getattr(self, "page_ready", False):
+            return
+        # Inline style on <html> beats the :root block in chat.css, so the page
+        # needs no change of its own beyond keeping the variables in one place.
+        js = "".join(
+            "document.documentElement.style.setProperty("
+            f"{json.dumps(k)}, {json.dumps(v)});"
+            for k, v in colors.items()
+        )
+        self.webview.evaluate_javascript(js, -1, None, None, None)
+
+    def watch_theme_palette(self):
+        """Re-apply the chat colours whenever the theme rewrites its palette."""
+        try:
+            palette = Gio.File.new_for_path(CHAT_THEME_FILE)
+            self._theme_monitor = palette.monitor_file(
+                Gio.FileMonitorFlags.NONE, None)
+            self._theme_monitor.connect("changed", self._on_theme_palette)
+        except Exception as exc:
+            self._theme_monitor = None
+            print("theme watch unavailable:", exc, flush=True)
+
+    def _on_theme_palette(self, *_a):
+        # The rewrite can be a rename, so re-read on the next idle rather than
+        # inside the monitor callback.
+        GLib.idle_add(self._apply_chat_theme_idle)
+
+    def _apply_chat_theme_idle(self):
+        self.apply_chat_theme()
+        return False
+
     def build_chat_view(self):
         manager = WebKit.UserContentManager()
         manager.register_script_message_handler("omatv")
@@ -1391,9 +1483,13 @@ class OmatvWindow(Adw.ApplicationWindow):
         # Returning True marks the event handled so WebKit doesn't also pop
         # its default "Back / Reload / Inspect Element" menu on top of it.
         wv.connect("context-menu", lambda view, ctx, event: True)
-        bg = Gdk.RGBA()
-        bg.parse("#131317")
-        wv.set_background_color(bg)
+        # The chat's background follows the GTK theme rather than a fixed hex:
+        # set it before the page loads so the first paint is already right, and
+        # watch the palette file so a theme switch repaints without a relaunch.
+        rgba = Gdk.RGBA()
+        rgba.parse(self.chat_theme_vars()["--bg"])
+        wv.set_background_color(rgba)
+        self.watch_theme_palette()
 
         html_path = os.path.join(CHAT_DIR, "chat.html")
         wv.load_uri("file://" + html_path)
@@ -1429,6 +1525,9 @@ class OmatvWindow(Adw.ApplicationWindow):
 
         if action == "ready":
             self.page_ready = True
+            # First chance to reach the document: paint the chat with the
+            # current theme's surfaces before anything else is pushed.
+            self.apply_chat_theme()
             backlog = getattr(self, "_js_backlog", [])
             self._js_backlog = []
             self.push_js(

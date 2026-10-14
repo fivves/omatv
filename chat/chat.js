@@ -973,23 +973,25 @@ function setConn(text, cls) {
 }
 
 // ---- uptime pill (replaces "connected · nick" while a stream is live) ----
+// Numbers only: h:mm:ss once past an hour, m:ss under one, so a fresh stream
+// reads 0:07 rather than 7s. No unit letters at all.
 function formatUptime(ms) {
   const s = Math.floor(ms / 1000);
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   const sec = s % 60;
-  if (h > 0) return `${h}h ${m}m ${sec}s`;
-  if (m > 0) return `${m}m ${sec}s`;
-  return `${sec}s`;
+  const pad = (n) => String(n).padStart(2, "0");
+  if (h > 0) return `${h}:${pad(m)}:${pad(sec)}`;
+  return `${m}:${pad(sec)}`;
 }
 function tickUptime() {
   if (!state.startedAt) return;
   const up = Date.now() - state.startedAt;
   if (up < 0) return; // clock skew; wait
-  const text = "live · " + formatUptime(up);
+  const text = formatUptime(up);
   if (connEl.textContent !== text) {
     connEl.textContent = text;
-    connEl.className = "conn connected";
+    connEl.className = "conn connected live";
   }
 }
 function setUptime(startedAtIso) {
@@ -1010,7 +1012,8 @@ function formatViewers(n) {
   return n.toLocaleString("en-US");
 }
 function setViewers(n) {
-  const text = formatViewers(n) + " watching";
+  const text = formatViewers(n);
+  if (!text) return;
   if (viewersEl.textContent !== text) {
     viewersEl.textContent = text;
     viewersEl.classList.add("live-viewers");
