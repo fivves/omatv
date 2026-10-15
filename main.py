@@ -104,7 +104,23 @@ CONFIG_CANDIDATES = [
 
 GL_DRAW_FRAMEBUFFER_BINDING = 0x8CA6
 
+# Font styles, ported from gTunes' "Font Style" control (ui.font.mono there).
+# The GTK side is a CSS class on the window; the chat WebView is a separate
+# engine the class cannot reach, so it gets the same choice pushed as a variable.
+FONT_UI = '"Inter", "Cantarell", system-ui, sans-serif'
+FONT_MONO = '"JetBrainsMono Nerd Font", "JetBrains Mono", monospace'
+
 APP_CSS = b"""
+/* Font style (ported from gTunes). `.font-mono *` restyles every widget in the
+   window; the chat page is handled separately in apply_chat_theme(). */
+.font-mono * {
+  font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace;
+}
+.font-style-toggle {
+  padding: 2px 8px;
+  min-width: 0;
+  min-height: 0;
+}
 .avatar-letter {
   border-radius: 9999px;
   background: #3f3f46;
@@ -786,6 +802,11 @@ class OmatvWindow(Adw.ApplicationWindow):
         self.set_title("omatv")
         self.set_default_size(1440, 900)
 
+        # Font style, restored from settings.json before the header is built (the
+        # toggle's active state reads it). Applied as a class once the CSS
+        # provider exists, below.
+        self.font_mono = bool(load_settings().get("font_mono", False))
+
         self.toast_overlay = Adw.ToastOverlay()
 
         header = Adw.HeaderBar()
@@ -844,6 +865,28 @@ class OmatvWindow(Adw.ApplicationWindow):
         user_chip.append(self.user_avatar)
         user_chip.append(user_name)
         self.user_btn.set_child(user_chip)
+        # Font style toggle: the same control gTunes has, a linked pair of icon
+        # toggles ("Default" / "Monospace"), persisted by set_font_mono().
+        font_btn_default = Gtk.ToggleButton()
+        font_btn_default.set_icon_name("font-x-generic-symbolic")
+        font_btn_default.set_tooltip_text("Default font")
+        font_btn_default.set_active(not self.font_mono)
+        font_btn_default.add_css_class("font-style-toggle")
+        font_btn_mono = Gtk.ToggleButton()
+        font_btn_mono.set_icon_name("utilities-terminal-symbolic")
+        font_btn_mono.set_tooltip_text("Monospace font")
+        font_btn_mono.set_active(self.font_mono)
+        font_btn_mono.add_css_class("font-style-toggle")
+        font_btn_mono.set_group(font_btn_default)
+        font_btn_mono.connect(
+            "toggled", lambda btn: self.set_font_mono(btn.get_active()))
+        self.font_toggle_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.font_toggle_box.add_css_class("linked")
+        self.font_toggle_box.set_valign(Gtk.Align.CENTER)
+        self.font_toggle_box.append(font_btn_default)
+        self.font_toggle_box.append(font_btn_mono)
+        header.pack_end(self.font_toggle_box)
         header.pack_end(self.user_btn)
         self.user_name_lbl = user_name
 
@@ -1067,6 +1110,9 @@ class OmatvWindow(Adw.ApplicationWindow):
             provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
+
+        if self.font_mono:
+            self.add_css_class("font-mono")
 
         # ---- layout state ------------------------------------------------
         self.view = "home"
@@ -1423,6 +1469,29 @@ class OmatvWindow(Adw.ApplicationWindow):
             "--panel-2": lift_hex(base, CHAT_PANEL_LIFT[1]),
         }
 
+    def set_font_mono(self, mono):
+        """Switch the whole app between the UI font and a monospace one.
+
+        Ported from gTunes' "Font Style" control: the GTK side is a CSS class on
+        the window (`.font-mono *` restyles the descendants), and the chat, being
+        a separate web engine, is pushed the matching variable. The choice
+        persists in settings.json, next to where the chat width used to live.
+        """
+        mono = bool(mono)
+        if mono == self.font_mono:
+            return
+        self.font_mono = mono
+        if mono:
+            self.add_css_class("font-mono")
+        else:
+            self.remove_css_class("font-mono")
+        settings = load_settings()
+        settings["font_mono"] = mono
+        save_settings(settings)
+        # Re-push the chat's variables so the WebView follows immediately.
+        self.apply_chat_theme()
+        print(f"font style: {'monospace' if mono else 'default'}", flush=True)
+
     def apply_chat_theme(self):
         """Push the current theme's surfaces into the chat page and its WebView.
 
@@ -1445,6 +1514,13 @@ class OmatvWindow(Adw.ApplicationWindow):
             "document.documentElement.style.setProperty("
             f"{json.dumps(k)}, {json.dumps(v)});"
             for k, v in colors.items()
+        )
+        # The chat is a separate web engine, so the window's `font-mono` class
+        # cannot reach inside it: the same font choice rides along as a variable.
+        js += (
+            "document.documentElement.style.setProperty("
+            f"{json.dumps('--chat-font')}, "
+            f"{json.dumps(FONT_MONO if self.font_mono else FONT_UI)});"
         )
         self.webview.evaluate_javascript(js, -1, None, None, None)
 

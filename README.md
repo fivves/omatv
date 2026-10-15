@@ -34,6 +34,8 @@ latency**.
   URLs (`/videos/`, `/directory`, …) are refused rather than guessed at.
 - **Sign in with a paste** — no Twitch dev portal needed; get a token from
   [twitchtokengenerator.com](https://twitchtokengenerator.com/) and paste it in.
+- **Font style** — switch the whole interface, chat included, between the
+  system font and a monospace one; the choice is remembered.
 
 ## Requirements
 

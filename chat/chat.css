@@ -17,7 +17,7 @@ html, body { height: 100%; }
 body {
   background: var(--bg);
   color: var(--text);
-  font-family: "Inter", "Cantarell", system-ui, sans-serif;
+  font-family: var(--chat-font, "Inter", "Cantarell", system-ui, sans-serif);
   font-size: 14px;
   overflow: hidden;
 }
