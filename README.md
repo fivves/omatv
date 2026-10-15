@@ -160,6 +160,11 @@ omatv/
 - **No follows rail** — your token lacks `user:read:follows`.
 - **Emotes/badges missing** — usually a transient API issue; switch channels
   or restart the app to reload.
+- **Video goes black-and-white and upside down** — a GTK bug in its GPU
+  (ngl/vulkan) renderer, which hands a `GtkGLArea`'s texture to the scene
+  graph through a copy it can clobber (GNOME/gtk#6703, GNOME/gtk#8133).
+  omatv forces `GSK_RENDERER=gl` at startup to sample the GLArea natively;
+  if you override that variable the corruption can return until a restart.
 
 ## License
 

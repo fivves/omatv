@@ -12,6 +12,16 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
+# GTK 4.18+ defaults to the GPU (ngl/vulkan) renderer, which hands a GtkGLArea's
+# GL texture to the scene graph through a cross-API copy. On this stack (GTK
+# 4.22 + mesa/radv) that path is both expensive and corrupt: GNOME/gtk#8133 is
+# the CPU copy it costs without GSK_RENDERER=gl, and GNOME/gtk#6703 is the
+# GLArea output texture being clobbered. Both showed up here as the video
+# freezing, then returning vertically flipped and washed out (restart only).
+# GTK's GL backend samples the GLArea texture natively, no copy, no clobber.
+# setdefault, so an explicit GSK_RENDERER in the environment still wins.
+os.environ.setdefault("GSK_RENDERER", "gl")
+
 import gi
 
 gi.require_version("Gtk", "4.0")
