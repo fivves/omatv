@@ -36,6 +36,11 @@ latency**.
   [twitchtokengenerator.com](https://twitchtokengenerator.com/) and paste it in.
 - **Font style** — switch the whole interface, chat included, between the
   system font and a monospace one; the choice is remembered.
+- **Phone-shaped windows** — shrink the window and the header slims to the
+  title, game, fullscreen and your avatar, dropping the font-style toggles,
+  the username and the stream title that were crowding that row. Widen it and
+  the full bar comes straight back. The chat toggle lives on the left at
+  every size.
 
 ## Requirements
 

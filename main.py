@@ -106,6 +106,12 @@ STREAM_ASPECT = 16 / 9      # what the video area is really judged on
 # that caps a child's natural width): the cap is the column width when the chat
 # is a side column, and effectively unlimited when it spans the bottom.
 CHAT_CLAMP_UNLIMITED = 100000
+# Below this window width the header drops to a minimal button layout (Eddie,
+# Oct 15 2026). WIDTH, not height, is what crowds the bar, so the rule keys on
+# width alone. Measured crowding: at phone widths (~540) the title block, the
+# chat-dock and fullscreen buttons, the font-style pair, the avatar+name chip
+# and libadwaita's own window controls were all fighting over the same row.
+HEADER_MINIMAL_W = 700
 CONFIG_CANDIDATES = [
     os.environ.get("OMATV_TWITCH_JSON", ""),
     os.path.expanduser("~/.config/twitch.json"),
@@ -1036,7 +1042,11 @@ class OmatvWindow(Adw.ApplicationWindow):
         self.chat_btn.add_css_class("flat")
         self.chat_btn.set_tooltip_text("Chat")
         self.chat_btn.connect("toggled", self._on_chat_toggle)
-        header.pack_end(self.chat_btn)
+        # START side, at every size (Eddie, Oct 15 2026). The chat is a primary
+        # action, and parking it in the end cluster made that cluster the thing
+        # that ran out of room at phone widths. The start side holds only this
+        # button, so the two ends stop competing for the same pixels.
+        header.pack_start(self.chat_btn)
 
         self.video_hud.put(self.watch_chrome, 0, 0)
         self.watch_chrome.set_visible(False)
@@ -1332,8 +1342,43 @@ class OmatvWindow(Adw.ApplicationWindow):
             return
         self._last_content_size = size
         home.dbg(f"content resize {size[0]}x{size[1]}")
+        self._apply_header_mode()
         self._apply_layout(snap=True)
         self.home_page._queue_reflow()
+
+    def _apply_header_mode(self):
+        """Drop the header to its minimal layout in a narrow window.
+
+        In a phone-shaped window the bar runs out of room long before anything is
+        actually wrong: the title block, the chat-dock and fullscreen buttons,
+        the font-style pair, the avatar+name chip and libadwaita's own window
+        controls all want the same row, so the stream title elides to an
+        ellipsis and the controls end up shoulder to shoulder.
+
+        Minimal keeps only actions and faces: the font-style pair goes because it
+        is a set-once preference rather than an action; the username goes because
+        the avatar already identifies the account and the button carries a
+        "Logged in as ..." tooltip; and the stream-title line goes with them
+        because at this width it rendered as nothing but "...", while the chat
+        header already shows the full title.
+
+        The chat toggle is deliberately NOT in this set: it lives on the header's
+        start side at every size (see where it is packed), so it is never part of
+        the crowded end cluster and there is no reason to take it away.
+
+        Hiding a widget frees its space without rebuilding anything, so every
+        pack keeps its position and widening the window restores the full bar
+        exactly.
+        """
+        w = self._content_size()[0]
+        minimal = w < HEADER_MINIMAL_W
+        if minimal == getattr(self, "_header_minimal", None):
+            return
+        self._header_minimal = minimal
+        self.font_toggle_box.set_visible(not minimal)
+        self.user_name_lbl.set_visible(not minimal)
+        self.subtitle.set_visible(not minimal)
+        home.dbg(f"header: {'minimal' if minimal else 'full'} at window {w}px")
 
     def _on_chat_toggle(self, btn):
         if self._chat_btn_guard:
@@ -1439,6 +1484,7 @@ class OmatvWindow(Adw.ApplicationWindow):
         return tile is self.watch_tile
 
     def on_first_map(self, *a):
+        self._apply_header_mode()
         self._apply_layout()
 
     def cleanup_players(self):
