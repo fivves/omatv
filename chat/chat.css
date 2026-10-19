@@ -146,12 +146,30 @@ body {
 #msgs::-webkit-scrollbar-track { background: transparent; }
 
 .msg {
+  position: relative;
   padding: 3px 6px;
   margin: 1px -6px;
   border-radius: 6px;
   line-height: 1.5;
   word-wrap: break-word;
   animation: msg-in .15s ease-out;
+}
+
+/* Hairline between consecutive messages. A pseudo-element rather than a border:
+   .msg carries a 6px radius for the mention and highlight backgrounds, and a
+   border would visibly curve up at both ends. It sits in the 2px channel the 1px
+   margins create, and the .msg + .msg selector means the first message gets no
+   line above it and the newest one gets none below. Same weight as #head's
+   divider so the chrome and the transcript agree. */
+.msg + .msg::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -1px;
+  height: 1px;
+  background: rgba(255,255,255,.06);
+  pointer-events: none;
 }
 
 @keyframes msg-in {
@@ -261,6 +279,17 @@ a.link:hover { text-decoration: underline; }
   align-items: center;
 }
 
+/* The text box and its emote button share ONE box, so a 15px glyph never costs
+   a separate pill's worth of width in a narrow window. The button sits inside
+   the input's right edge as a sibling of it, never a child, so it can never be
+   picked up as editable content and sent with the message. */
+#input-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
+
 /* Live message preview (renders emotes before sending) */
 #preview-wrap {
   display: flex;
@@ -304,7 +333,7 @@ a.link:hover { text-decoration: underline; }
   border-radius: 10px;
   color: var(--text);
   font-size: 13px;
-  padding: 8px 12px;
+  padding: 8px 40px 8px 12px; /* right clears the in-field emote button */
   outline: none;
   transition: border-color .15s;
   white-space: pre-wrap;
@@ -314,6 +343,11 @@ a.link:hover { text-decoration: underline; }
   line-height: 1.45;
 }
 #msg-input:focus { border-color: var(--accent); }
+/* Thin like #msgs and #emote-grid, and exactly as wide as the button's offset,
+   so a tall multi-line draft cannot put a scrollbar under the emote glyph. */
+#msg-input::-webkit-scrollbar { width: 6px; }
+#msg-input::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 3px; }
+#msg-input::-webkit-scrollbar-track { background: transparent; }
 #msg-input:empty::before {
   content: attr(data-placeholder);
   color: var(--muted);
@@ -339,14 +373,26 @@ a.link:hover { text-decoration: underline; }
   font-weight: 600;
   transition: filter .12s;
 }
-#emote-btn { padding: 8px 10px; }
+#emote-btn {
+  position: absolute;
+  right: 6px;
+  bottom: 8px;
+  padding: 3px 5px;
+  font-size: 15px;
+  line-height: 1;
+  background: transparent;
+  border: none;
+  border-radius: 7px;
+  opacity: .75;
+}
+#emote-btn:hover { background: rgba(255,255,255,.1); opacity: 1; }
 #send-btn {
   padding: 9px 16px;
   background: linear-gradient(135deg, var(--accent), var(--accent-2));
   border: none;
   color: white;
 }
-#send-btn:hover, #emote-btn:hover { filter: brightness(1.15); }
+#send-btn:hover { filter: brightness(1.15); }
 #send-btn:disabled { opacity: .45; filter: none; cursor: default; }
 
 #notice {
