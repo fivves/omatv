@@ -11,6 +11,7 @@ import time
 import urllib.parse
 import urllib.request
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 
 # GTK 4.18+ defaults to the GPU (ngl/vulkan) renderer, which hands a GtkGLArea's
 # GL texture to the scene graph through a cross-API copy. On this stack (GTK
@@ -37,6 +38,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CHAT_DIR = os.path.join(HERE, "chat")
 CACHE = os.path.expanduser("~/.cache/omatv")
 AVATAR_DIR = os.path.join(CACHE, "avatars")
+EMOTE_DIR = os.path.join(CACHE, "emotes")
+# Emote sets and badge maps change when you sub, unsub, or a channel changes its
+# emotes, not hour to hour, so a window this wide costs nothing and saves every
+# launch a pile of round trips. Keys carry the account/channel id, so switching
+# Twitch accounts cannot serve one account's emotes to another.
+EMOTE_TTL_S = 6 * 3600
+# The bridge's fetch proxy is generic, so only these hosts (the third-party
+# emote lists the chat pulls on startup) get cached; any other url stays live.
+EMOTE_HOSTS = ("betterttv.net", "frankerfacez.com", "7tv.io")
 SETTINGS_PATH = os.path.expanduser("~/.config/omatv/settings.json")
 DEFAULT_CHAT_WIDTH = 340
 
@@ -320,15 +330,17 @@ class TwitchAPI:
     def fetch_badges(self, broadcaster_id):
         """Fetch global + channel badge sets via Helix. Returns a JSON string
         mapping set_id -> {version_id: image_url_2x}."""
-        out = {}
         urls = ["https://api.twitch.tv/helix/chat/badges/global"]
         if broadcaster_id:
             urls.append(
                 "https://api.twitch.tv/helix/chat/badges?broadcaster_id="
                 + urllib.parse.quote(broadcaster_id)
             )
-        for url in urls:
-            try:
+
+        def one(url):
+            key = "url-" + cache_key_for_url(url)[0]
+
+            def produce():
                 req = urllib.request.Request(
                     url,
                     headers={
@@ -337,19 +349,25 @@ class TwitchAPI:
                     },
                 )
                 with urllib.request.urlopen(req, timeout=10) as r:
-                    data = json.load(r).get("data", [])
-                for s in data:
-                    sid = s.get("set_id", "")
-                    if not sid:
-                        continue
-                    versions = out.setdefault(sid, {})
-                    for v in s.get("versions", []):
-                        vid = v.get("id", "")
-                        url2x = v.get("image_url_2x") or v.get("image_url_1x")
-                        if vid and url2x:
-                            versions[vid] = url2x
+                    return json.load(r).get("data", [])
+
+            try:
+                return cached(key, produce)[0]
             except Exception:
-                continue
+                return []
+
+        out = {}
+        for data in fetch_all(urls, one):
+            for s in data:
+                sid = s.get("set_id", "")
+                if not sid:
+                    continue
+                versions = out.setdefault(sid, {})
+                for v in s.get("versions", []):
+                    vid = v.get("id", "")
+                    url2x = v.get("image_url_2x") or v.get("image_url_1x")
+                    if vid and url2x:
+                        versions[vid] = url2x
         return json.dumps(out, ensure_ascii=False)
 
     def stream_info(self, login_or_id):
@@ -410,6 +428,73 @@ def download_avatar(user_id, url):
         with open(path, "wb") as f:
             f.write(data)
     return path
+
+
+def cache_key_for_url(url):
+    """Cache key for a request url, or None when it must not be cached."""
+    parts = urllib.parse.urlsplit(url)
+    return hashlib.sha1(url.encode("utf-8")).hexdigest() + ".json", (parts.hostname or "")
+
+
+def emote_cache_key(url):
+    """Cache key for the third-party emote-list urls, else None."""
+    key, host = cache_key_for_url(url)
+    if not any(host == h or host.endswith("." + h) for h in EMOTE_HOSTS):
+        return None
+    return "url-" + key
+
+
+def cache_load(key):
+    """(body, age_seconds) for a cached blob, or (None, None)."""
+    try:
+        with open(os.path.join(EMOTE_DIR, key), "r", encoding="utf-8") as fh:
+            blob = json.load(fh)
+        return blob.get("body"), time.time() - float(blob.get("ts", 0))
+    except Exception:
+        return None, None
+
+
+def cache_save(key, body):
+    """Write atomically, so a kill mid-write cannot leave a half file behind."""
+    try:
+        os.makedirs(EMOTE_DIR, exist_ok=True)
+        path = os.path.join(EMOTE_DIR, key)
+        with open(path + ".tmp", "w", encoding="utf-8") as fh:
+            json.dump({"ts": time.time(), "body": body}, fh)
+        os.replace(path + ".tmp", path)
+    except Exception:
+        pass
+
+
+def cached(key, produce, ttl=EMOTE_TTL_S):
+    """(body, freshly_fetched) for a blob.
+
+    Serves the cached copy while it is fresh, refreshes it when it is not, and
+    keeps the stale copy when the refresh fails, since stale emote names still
+    render and beat no emotes at all on a flaky connection."""
+    body, age = cache_load(key)
+    if body is not None and age is not None and age < ttl:
+        return body, False
+    try:
+        fresh = produce()
+    except Exception:
+        if body is not None:
+            return body, False
+        raise
+    cache_save(key, fresh)
+    return fresh, True
+
+
+def fetch_all(items, fn, workers=8):
+    """Run fn over items concurrently, keeping input order.
+
+    Each urllib urlopen opens its own connection, so every item pays a fresh DNS
+    + TCP + TLS handshake. The twenty emote sets are independent, and fetching
+    them one at a time was the whole of the chat's startup delay."""
+    if not items:
+        return []
+    with ThreadPoolExecutor(max_workers=min(workers, len(items))) as pool:
+        return list(pool.map(fn, items))
 
 
 def order_rail(rail, order):
@@ -1610,7 +1695,23 @@ class OmatvWindow(Adw.ApplicationWindow):
             enable_developer_extras=True,
             enable_write_console_messages_to_stdout=True,
         )
-        wv = WebKit.WebView(settings=settings, user_content_manager=manager)
+        # The default network session writes NOTHING to disk on this stack: its
+        # cache directory sits at two files however many emote images load, so
+        # every launch re-downloaded every emote from the CDN. An explicit
+        # session with its own directories does cache them (measured: 10 images
+        # -> 17 files / 67 KB), and the emote CDN sends max-age=14400, so they
+        # come back off disk instead of the wire. The chat needs no cookies or
+        # site storage (all of its API work goes through the bridge), so fresh
+        # storage for this session costs nothing.
+        self.network_session = WebKit.NetworkSession(
+            data_directory=os.path.join(CACHE, "webkit-data"),
+            cache_directory=os.path.join(CACHE, "webkit-cache"),
+        )
+        wv = WebKit.WebView(
+            settings=settings,
+            user_content_manager=manager,
+            network_session=self.network_session,
+        )
         # The chat page owns right-click: it shows its own reply/copy menu.
         # Returning True marks the event handled so WebKit doesn't also pop
         # its default "Back / Reload / Inspect Element" menu on top of it.
@@ -1679,8 +1780,12 @@ class OmatvWindow(Adw.ApplicationWindow):
             print(f"[omBridge] fetch: {url[:60]}", flush=True)
 
             def work():
+                key = emote_cache_key(url)
                 try:
-                    body = fetch_json(url)
+                    if key:
+                        body, _fresh = cached(key, lambda: fetch_json(url))
+                    else:
+                        body = fetch_json(url)
                     ok, payload = True, body
                 except Exception as e:
                     print(f"[omBridge] fetch ERROR: {e}", flush=True)
@@ -1748,7 +1853,6 @@ class OmatvWindow(Adw.ApplicationWindow):
         """Fetch global + channel + the viewer's own-channel emotes via Helix,
         as a JSON string. The viewer's own channel emotes are included so they
         can use their own subscriber emotes in any chat."""
-        emotes = []
         urls = [
             "https://api.twitch.tv/helix/chat/emotes/global",
         ]
@@ -1762,31 +1866,42 @@ class OmatvWindow(Adw.ApplicationWindow):
                 "https://api.twitch.tv/helix/chat/emotes?broadcaster_id="
                 + urllib.parse.quote(self.api.user_id)
             )
-        for url in urls:
+
+        def fetch_url(url):
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Client-ID": self.api.client_id,
+                    "Authorization": "Bearer " + self.api.token,
+                },
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.load(r).get("data", [])
+            out = []
+            for e in data:
+                eid = e.get("id", "")
+                name = e.get("name", "")
+                if eid and name:
+                    out.append(
+                        {
+                            "name": name,
+                            "url": f"https://static-cdn.jtvnw.net/emoticons/v2/{eid}/default/dark/2.0",
+                            "provider": "Twitch",
+                        }
+                    )
+            return out
+
+        def one(url):
+            key = "url-" + cache_key_for_url(url)[0]
             try:
-                req = urllib.request.Request(
-                    url,
-                    headers={
-                        "Client-ID": self.api.client_id,
-                        "Authorization": "Bearer " + self.api.token,
-                    },
-                )
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    data = json.load(r).get("data", [])
-                for e in data:
-                    eid = e.get("id", "")
-                    name = e.get("name", "")
-                    if eid and name:
-                        emotes.append(
-                            {
-                                "name": name,
-                                "url": f"https://static-cdn.jtvnw.net/emoticons/v2/{eid}/default/dark/2.0",
-                                "provider": "Twitch",
-                            }
-                        )
+                return cached(key, lambda: fetch_url(url))[0]
             except Exception:
                 # skip URL failures (e.g. empty broadcaster_id -> 400)
-                continue
+                return []
+
+        emotes = []
+        for chunk in fetch_all(urls, one):
+            emotes.extend(chunk)
         return json.dumps(emotes, ensure_ascii=False)
 
     def fetch_emote_sets(self, set_ids):
@@ -1797,10 +1912,13 @@ class OmatvWindow(Adw.ApplicationWindow):
 
         NOTE: the /chat/emotes/set endpoint accepts only ONE emote_set_id per
         request (multiple IDs return 0 results), so fetch each set separately."""
-        emotes = []
         ids = [s.strip() for s in set_ids.split(",") if s.strip()]
-        for sid in ids:
-            try:
+        hits = []
+
+        def one(sid):
+            key = "set-" + sid + ".json"
+
+            def produce():
                 url = "https://api.twitch.tv/helix/chat/emotes/set?emote_set_id=" + urllib.parse.quote(sid)
                 req = urllib.request.Request(
                     url,
@@ -1811,20 +1929,37 @@ class OmatvWindow(Adw.ApplicationWindow):
                 )
                 with urllib.request.urlopen(req, timeout=10) as r:
                     data = json.load(r).get("data", [])
+                out = []
                 for e in data:
                     eid = e.get("id", "")
                     name = e.get("name", "")
                     if eid and name:
-                        emotes.append(
+                        out.append(
                             {
                                 "name": name,
                                 "url": f"https://static-cdn.jtvnw.net/emoticons/v2/{eid}/default/dark/2.0",
                                 "provider": "Twitch",
                             }
                         )
+                return out
+
+            try:
+                body, fresh = cached(key, produce)
+                hits.append(fresh)
+                return body
             except Exception:
                 # skip sets that fail to resolve (bad UUIDs etc.)
-                continue
+                return []
+
+        emotes = []
+        for chunk in fetch_all(ids, one):
+            emotes.extend(chunk)
+        fetched = sum(1 for h in hits if h)
+        print(
+            f"[omBridge] emote_sets: {len(ids)} sets, {len(ids) - fetched} from cache, "
+            f"{fetched} fetched",
+            flush=True,
+        )
         return json.dumps(emotes, ensure_ascii=False)
 
     def resolve_http(self, rid, ok, payload):
