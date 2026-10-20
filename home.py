@@ -506,7 +506,17 @@ class HomePage:
         # follows refresh does not know about them. Their cids are protected
         # here until the channel is left again, otherwise update() would evict
         # the tile mid-watch and take the player down with it.
+        # Guest tiles exist ONLY to own a player for a pasted/dropped channel
+        # that may not be followed. self.pinned protects them from the 60s
+        # follows refresh evicting them mid-watch; self.guest is what keeps them
+        # OUT of the grid itself, which is the point: a channel you dragged in
+        # must never show up as a home tile.
         self.pinned = set()
+        self.guest = set()
+        # cid of a guest tile that has been STOPPED and hidden but deliberately
+        # kept alive for re-use. See park_guest(): destroying the widget that was
+        # just the full-size watch video blanks the whole window.
+        self.parked = None
         self.anim = Anim(self, surface)
         self._active = False
         self.mode = "home"
@@ -587,8 +597,8 @@ class HomePage:
                 f"tile={tile.uid}"
             )
 
-        self._set_count(len(self.tiles))
-        self.win.set_home_empty(not self.tiles)
+        self._set_count(len(self.grid_cids()))
+        self.win.set_home_empty(not self.grid_cids())
 
         self._reflow(motion=True, departing=removed, arriving=new_tiles)
         self._queue_sync()
@@ -605,23 +615,37 @@ class HomePage:
         if not cid:
             return None
         tile = self.tiles.get(cid)
+        if tile is None:
+            # Re-use the parked guest widget rather than building (and later
+            # destroying) a second GLArea.
+            tile = self._reclaim_parked(info)
         if tile is not None:
+            if self.parked == cid:
+                # The channel we parked is being opened again: bring it back.
+                self.parked = None
+                tile.set_visible(True)
             tile.update_info(info)
             self.pinned.add(cid)
+            if cid not in self.order:
+                # A reclaimed parked widget arrives under a new cid: register it
+                # as this channel's guest tile.
+                self.order.append(cid)
+                self.guest.add(cid)
             return tile
         tile = Tile(self, info)
         tile.set_opacity(0.0)
         self.tiles[cid] = tile
         self.order.append(cid)
         self.pinned.add(cid)
+        self.guest.add(cid)
         self.surface.put(tile, 0, 0)
         dbg(
             f"grid guest add channel={info.get('login')} cid={cid} "
             f"tile={tile.uid} player={tile.va.pid}"
         )
         self._reflow(motion=True, arriving=[tile])
-        self._set_count(len(self.tiles))
-        self.win.set_home_empty(False)
+        self._set_count(len(self.grid_cids()))
+        self.win.set_home_empty(not self.grid_cids())
         self._queue_sync()
         return tile
 
@@ -630,6 +654,118 @@ class HomePage:
         if cid in self.pinned:
             self.pinned.discard(cid)
             dbg(f"grid guest unpin cid={cid}")
+
+    def is_guest(self, cid):
+        return cid in self.guest
+
+    def grid_cids(self):
+        """cids that actually occupy a home grid cell (guests excluded)."""
+        return [cid for cid in self.order if cid not in self.guest]
+
+    def remove_guest(self, cid):
+        """Erase a guest tile entirely, player and all.
+
+        A dropped channel is a one-shot: leaving the watch view destroys it
+        rather than shrinking it back into a cell it does not have, so nothing
+        is left behind on the home grid.
+        """
+        tile = self.tiles.pop(cid, None)
+        self.pinned.discard(cid)
+        self.guest.discard(cid)
+        if cid in self.order:
+            self.order.remove(cid)
+        if tile is None:
+            return
+        self.anim.cancel(f"grow-{tile.uid}")
+        self.anim.cancel(f"arr-{tile.uid}")
+        self._stop_tile(tile)
+        if tile.get_parent() is not None:
+            self.surface.remove(tile)
+        print(f"[omatv][guest] remove cid={cid} tile={tile.uid}", flush=True)
+        if self.parked == cid:
+            self.parked = None
+        self._set_count(len(self.grid_cids()))
+        self.win.set_home_empty(not self.grid_cids())
+
+    def park_guest(self, cid):
+        """Stop a guest tile and keep its WIDGET alive, out of the grid.
+
+        Destroying the widget that was just the full-size watch video is what
+        blanked Eddie's whole window: removing it from the surface unrealizes
+        its GLArea, which frees the mpv render context and terminates mpv on the
+        same GL context GSK paints every other widget with, so the header, grid
+        and chat all go black while the process stays alive (no core dump, no
+        Python traceback, window still mapped). Measured twice: once from the
+        60s eviction fade and once from an immediate remove.
+
+        So the tile is STOPPED and hidden instead, and the next pasted/dropped
+        channel re-uses it (_reclaim_parked). Nothing is destroyed while it could
+        still be the thing on screen; app close tears guests down through the
+        path that has always been clean.
+        """
+        tile = self.tiles.get(cid)
+        if tile is None:
+            return None
+        self._stop_tile(tile)
+        self.anim.cancel(f"grow-{tile.uid}")
+        tile.set_opacity(0.0)
+        tile.set_visible(False)
+        self.pinned.add(cid)
+        self.guest.add(cid)
+        self.parked = cid
+        print(f"[omatv][guest] park cid={cid} tile={tile.uid} (widget kept alive)",
+              flush=True)
+        self._set_count(len(self.grid_cids()))
+        self.win.set_home_empty(not self.grid_cids())
+        return tile
+
+    def _reclaim_parked(self, info):
+        """Move the parked guest tile onto a NEW channel and hand it back.
+
+        Re-using the widget is the whole point of parking: no GLArea is ever
+        unrealized for a channel that was recently on screen. Returns None when
+        there is nothing to re-use or the cid already matches.
+        """
+        cid = self.parked
+        new = info.get("id")
+        if not cid or not new or cid == new:
+            return None
+        tile = self.tiles.pop(cid, None)
+        self.pinned.discard(cid)
+        self.guest.discard(cid)
+        if cid in self.order:
+            self.order.remove(cid)
+        self.parked = None
+        if tile is None:
+            return None
+        tile.cid = new
+        tile.login = info["login"]
+        tile.name = info.get("name") or info["login"]
+        tile.info = dict(info)
+        tile.cell = None
+        tile.watch = False
+        tile.update_info(info)
+        self.tiles[new] = tile
+        # The widget never left the surface while parked, so it must NOT be put
+        # again (Gtk.Fixed.put on a parented child is a warning, not a re-parent).
+        # Show it again from transparent: _select fades a tile whose opacity is
+        # below 1.0 back up, and a still-hidden widget would grow into an
+        # invisible video area (the black-screen bug from the rail-switch path).
+        tile.set_opacity(0.0)
+        tile.set_visible(True)
+        print(f"[omatv][guest] reclaim {cid} -> {new} tile={tile.uid}", flush=True)
+        return tile
+
+    def sweep_guests(self, keep=None):
+        """Erase leftover guest tiles, sparing the given cid and the parked one.
+
+        A guest that is neither the current watch tile nor parked is stopped and
+        was not on screen, so this is the ordinary eviction path.
+        """
+        for cid in list(self.guest):
+            if cid == keep or cid == self.parked:
+                continue
+            self.remove_guest(cid)
 
     def _set_count(self, n):
         btn = getattr(self.win, "home_btn", None)
@@ -666,7 +802,10 @@ class HomePage:
         tile_w = max(MIN_TILE_W, (avail - (cols - 1) * GRID_GAP) // cols)
         tile_h = int(tile_w * 9 / 16)
         cells = {}
-        for idx, cid in enumerate(self.order):
+        # Guest tiles take no cell. _reflow skips any cid without one, so a
+        # dropped channel neither appears on the grid nor shifts real tiles.
+        grid_order = [cid for cid in self.order if cid not in self.guest]
+        for idx, cid in enumerate(grid_order):
             r, c = divmod(idx, cols)
             x = GRID_MARGIN + c * (tile_w + GRID_GAP)
             y = GRID_MARGIN + r * (tile_h + GRID_GAP)
@@ -777,7 +916,12 @@ class HomePage:
             # Back on the grid every tile shows its chrome and re-enters the
             # scroller's layout again. Belt and braces: the handoff also calls
             # set_tile_watch(tile, False).
-            for t in self.tiles.values():
+            for cid, t in self.tiles.items():
+                if cid in self.guest:
+                    # Never come back onto the grid: a guest is only ever the
+                    # channel currently open in the watch view.
+                    t.set_visible(False)
+                    continue
                 self.set_tile_chrome(t, True)
                 t.set_visible(True)
         else:

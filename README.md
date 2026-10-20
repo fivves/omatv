@@ -32,6 +32,10 @@ latency**.
 - **Watch a pasted link** — `Ctrl+V` on the home grid opens the twitch.tv
   channel in your clipboard, whether or not you follow it. Non-channel Twitch
   URLs (`/videos/`, `/directory`, …) are refused rather than guessed at.
+- **Drag a link or a name in** — drag a twitch.tv link from your browser, or
+  just a channel name from anywhere, onto the window and it opens. A drop works
+  on the watch view too: drop one on a playing stream and it switches to that
+  channel.
 - **Sign in with a paste** — no Twitch dev portal needed; get a token from
   [twitchtokengenerator.com](https://twitchtokengenerator.com/) and paste it in.
 - **Font style** — switch the whole interface, chat included, between the
@@ -104,8 +108,11 @@ completion, Tab completes emotes, and right-clicking a message offers Reply or
 Copy message. The house button at the top of the rail returns to the grid.
 
 To watch something you don't follow, copy its twitch.tv link and press `Ctrl+V`
-on the grid — the channel opens as a guest tile. It's a one-shot: going back home
-forgets it again.
+on the grid, or drag a link onto the window — from a browser, a chat client,
+anywhere. A bare channel name works as a drop too. Dragging works on the watch
+view as well: drop a link on a stream that's playing and it switches to that
+channel. Either way the channel is a guest: it never joins the home grid, and
+going back home lets it go.
 
 ## How it works
 

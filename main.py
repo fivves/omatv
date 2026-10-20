@@ -28,7 +28,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("WebKit", "6.0")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango, WebKit
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango, WebKit
 
 import home
 import mpv
@@ -581,6 +581,27 @@ def parse_twitch_login(text):
     if not segs:
         return None
     return _clean_login(segs[0])
+
+
+def parse_dropped_login(text):
+    """Pull a channel login out of DROPPED text, or None if it is not one.
+
+    A drag is looser than a paste: dragging a Discord message or a selected name
+    hands over plain words, so a bare login ("shroud") is accepted here where
+    the clipboard path insists on a link. Anything carrying a scheme, a path
+    separator or whitespace is NOT a name, and that is what stops a dropped
+    FILE ("file:///home/eddie/...") from being opened as a channel called
+    "home". Real link forms are the other parser's job; this one only ever sees
+    what that one refused.
+    """
+    raw = (text or "").strip()
+    if not raw or len(raw) > 400:
+        return None
+    if "://" in raw or "/" in raw or "\\" in raw:
+        return None
+    if any(ch.isspace() for ch in raw):
+        return None
+    return _clean_login(raw)
 
 
 class StreamerButton(Gtk.Button):
@@ -1280,6 +1301,112 @@ class OmatvWindow(Adw.ApplicationWindow):
         key_ctrl.connect("key-pressed", self.on_paste_key)
         self.add_controller(key_ctrl)
 
+        # Drag a Twitch link (or a bare channel name) onto the window and it
+        # opens, followed or not. Same parser, same guest tile, same watch path
+        # as the paste above, so chat, badges and emotes all resolve. The
+        # targets live on the WINDOW rather than on the home page: dropping onto
+        # a stream that is already playing must switch to the dragged channel,
+        # and that swap is exactly what _select already does for a tile click.
+        # Ctrl+V deliberately stays home-only; a drop never touches the chat
+        # composer, so it needs no such guard.
+        self.install_drop_targets()
+
+    # ---- drag a Twitch link or name in to watch it ------------------------
+    def install_drop_targets(self):
+        """Accept a dropped Twitch URL or channel name anywhere on the window.
+
+        ONE target carrying BOTH gtypes, not one target per gtype. A browser
+        link drag offers text/uri-list AND text/plain, so it matches both, and
+        with two separate targets on the same widget GTK re-picks between them
+        as the pointer moves: the accepted state flaps and the drop lands only
+        if the release happens on a good flip. Measured that failure exactly:
+        ONE successful drop out of 80 accepted drags, then nothing. GTK 4.24
+        supports multiple gtypes on a single target (set_gtypes), which removes
+        the ambiguity entirely.
+
+        preload makes GTK fetch the value at drag-enter, which is what lets the
+        log show the data BEFORE a drop happens.
+        """
+        target = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        target.set_gtypes([Gdk.FileList, GObject.TYPE_STRING])
+        target.set_preload(True)
+        target.connect("accept", self.on_drop_accept)
+        target.connect("notify::value", self.on_drop_value)
+        target.connect("drop", self.on_drop)
+        self.add_controller(target)
+        self.drop_target = target
+
+    def on_drop_value(self, target, pspec):
+        """Preloaded value arrived (drag-enter): log what is being carried.
+
+        Informational only. Nothing is accepted or rejected here; ::drop is
+        still where the decision is made, so a stray log cannot break the drag.
+        """
+        try:
+            value = target.get_value()
+        except Exception:
+            return
+        login = self._drop_login(value)
+        print(
+            f"[omatv][drop] value {type(value).__name__} -> login={login}",
+            flush=True,
+        )
+
+    def on_drop_accept(self, target, drop):
+        """Log what a drag is actually offering as it enters the window.
+
+        SIGNATURE IS EXACTLY (target, drop): Gtk.DropTarget::accept carries no
+        x/y (verified from GObject.signal_query), and a handler that asks for
+        them raises TypeError on EVERY drag enter, which rejects the drag and
+        the drop never fires. That is what "drag and drop doesn't work" looked
+        like: the log showed this TypeError instead of a drop.
+
+        A drag cannot be replayed after the fact and the source's choice of
+        formats is what decides whether a drop lands, so record it.
+        """
+        try:
+            formats = drop.get_formats().to_string()
+        except Exception:
+            formats = "?"
+        print(f"[omatv][drop] enter formats={formats}", flush=True)
+        # MUST return True (GtkDropTarget::accept docs): "If the drop is not
+        # accepted, FALSE will be returned and the drop target will ignore the
+        # drop." Returning False rejects the drag at entry, so ::drop NEVER
+        # fires and the whole feature silently does nothing, which is exactly
+        # what it looked like. If the value turns out not to be a channel,
+        # on_drop returns False instead, which is the correct place to reject.
+        return True
+
+    @staticmethod
+    def _drop_login(value):
+        """Map a dropped value (file list or string) to a channel login."""
+        candidates = []
+        if isinstance(value, Gdk.FileList):
+            for gfile in value.get_files():
+                try:
+                    candidates.append(gfile.get_uri() or "")
+                except Exception:
+                    pass
+        elif isinstance(value, str):
+            candidates.append(value)
+        for raw in candidates:
+            login = parse_twitch_login(raw) or parse_dropped_login(raw)
+            if login:
+                return login
+        return None
+
+    def on_drop(self, target, value, x, y):
+        """Open whichever Twitch channel the dropped value names."""
+        login = self._drop_login(value)
+        if login:
+            print(f"[omatv][drop] -> login={login}", flush=True)
+            self.watch_pasted_channel(login)
+            return True
+        # A dropped file or arbitrary text is not ours: fall through rather than
+        # opening some random channel off a dragged word.
+        print(f"[omatv][drop] ignored, not a channel: {type(value).__name__}", flush=True)
+        return False
+
     # ---- responsive layout ------------------------------------------------
     def _content_size(self):
         w = self.grid_scroller.get_width()
@@ -1685,6 +1812,35 @@ class OmatvWindow(Adw.ApplicationWindow):
         self.apply_chat_theme()
         return False
 
+    def on_chat_decide_policy(self, view, decision, decision_type):
+        """Keep the chat page from navigating anywhere but itself.
+
+        Its only legitimate load is the local chat.html. Without this, anything
+        that makes WebKit follow a URL (a dropped link landing on the WebView's
+        own drop target, a stray anchor) replaces the page and the chat is gone
+        until the watchdog notices 90s later.
+        """
+        if decision_type != WebKit.PolicyDecisionType.NAVIGATION_ACTION:
+            return False
+        try:
+            uri = decision.get_navigation_action().get_request().get_uri() or ""
+        except Exception:
+            return False
+        if uri.startswith("file://" + CHAT_DIR):
+            return False
+        decision.ignore()
+        print(f"[omatv][chat] blocked navigation to {uri[:100]}", flush=True)
+        # A link dropped over the CHAT panel is WebKit's drop target, not the
+        # window's (WebKit registers its controllers at construction, before any
+        # added later, and its reaction to a dropped URL is to navigate). Turn
+        # that into the feature instead of swallowing it: open the channel and
+        # keep the chat page where it is.
+        login = parse_twitch_login(uri)
+        if login:
+            print(f"[omatv][drop] chat-surface drop -> login={login}", flush=True)
+            self.watch_pasted_channel(login)
+        return True
+
     def build_chat_view(self):
         manager = WebKit.UserContentManager()
         manager.register_script_message_handler("omatv")
@@ -1716,6 +1872,13 @@ class OmatvWindow(Adw.ApplicationWindow):
         # Returning True marks the event handled so WebKit doesn't also pop
         # its default "Back / Reload / Inspect Element" menu on top of it.
         wv.connect("context-menu", lambda view, ctx, event: True)
+        # A dropped link over the CHAT surface is WebKit's own drop target, not
+        # the window's (its controller is registered at construction, before any
+        # we add), and its default reaction to a dropped URL is to NAVIGATE,
+        # which would replace the chat page with a web page and leave the chat
+        # dead until the watchdog rebuilt it. The chat never navigates by
+        # design, so veto any load that is not its own file.
+        wv.connect("decide-policy", self.on_chat_decide_policy)
         # The chat's background follows the GTK theme rather than a fixed hex:
         # set it before the page loads so the first paint is already right, and
         # watch the palette file so a theme switch repaints without a relaunch.
@@ -2543,18 +2706,29 @@ class OmatvWindow(Adw.ApplicationWindow):
         self.push_js({"type": "stream_start", "started_at": "", "viewers": 0})
         if tile is not None:
             self.home_page.set_tile_watch(tile, False)
-            # shrink the live video back into its exact grid cell
-            self.home_page.restore_tile(tile)
-            # A channel opened by paste-to-watch is a one-shot guest: stop
-            # protecting it so the next follows refresh takes it back out of
-            # the grid. Channels you actually follow were never pinned, so this
-            # is a no-op for them.
-            self.home_page.unpin(tile.cid)
+            if self.home_page.is_guest(tile.cid):
+                # A pasted/dropped channel never belongs on the grid, so leaving
+                # the watch view takes it off the screen. It is PARKED, not
+                # destroyed: removing the widget that was just the full-size
+                # watch video unrealizes its GLArea and frees the mpv render
+                # context on GSK's own GL context, which blanked every surface in
+                # the window (header, grid and chat) while the process kept
+                # running. The parked widget is re-used by the next drop.
+                self.home_page.park_guest(tile.cid)
+                # Leftover guests from earlier drops were never on screen, so
+                # erasing those is the ordinary eviction path.
+                self.home_page.sweep_guests(keep=tile.cid)
+            else:
+                # shrink the live video back into its exact grid cell
+                self.home_page.restore_tile(tile)
+                # Channels you actually follow were never pinned, so this is a
+                # no-op for them.
+                self.home_page.unpin(tile.cid)
         for cid in self.home_page.order:
             t = self.home_page.tiles.get(cid)
             if t is not None:
                 self.home_page.fade_tile(t, 1.0)
-        self.set_home_empty(not self.home_page.tiles)
+        self.set_home_empty(not self.home_page.grid_cids())
         self._apply_layout()
         self.home_page.restart_all()
 
