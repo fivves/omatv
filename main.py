@@ -704,6 +704,9 @@ class VideoArea(Gtk.GLArea):
         self._init_params = None
         self._gl = None
         self._pending_url = None
+        # Set by HomePage while a tile is waiting for its first frame; consumed
+        # by _on_video_params. None means "nobody is waiting".
+        self.first_frame_cb = None
         self.connect("realize", self.on_realize)
         self.connect("render", self.on_render)
         self.connect("unrealize", self.on_unrealize)
@@ -720,6 +723,21 @@ class VideoArea(Gtk.GLArea):
             return not p.core_idle
         except Exception:
             return False
+
+    def _on_video_params(self, _name, value):
+        """mpv pushed a frame size: a picture exists. Tell the grid ONCE.
+
+        The callback is consumed on fire (`first_frame_cb = None`), so the grid
+        re-arms it per load and a resize/mid-stream change cannot re-trigger a
+        reveal for a tile that is already showing.
+        """
+        if not value:
+            return  # stream stopped / params cleared
+        cb = self.first_frame_cb
+        if cb is None:
+            return
+        self.first_frame_cb = None
+        idle(cb)
 
     def on_realize(self, *a):
         self.make_current()
@@ -832,6 +850,13 @@ class VideoArea(Gtk.GLArea):
             url = self._pending_url
             self._pending_url = None
             self.player.command("loadfile", url)
+
+        # First-frame notification for the home grid's loading scrim. mpv only
+        # publishes video-params once a stream has produced a picture, and
+        # property changes are PUSHED, so this costs nothing while idle: the
+        # grid crossfades its scrim on the event instead of polling a property
+        # twelve times a second per tile.
+        self.player.observe_property("video-params/w", self._on_video_params)
 
     def on_render(self, area, ctx):
         if not self.render_ctx:

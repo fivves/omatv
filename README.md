@@ -16,6 +16,9 @@ latency**.
 - **Home grid** — every followed channel that's live, as a grid of real muted
   160p players. Clicking a tile moves that already-running player into the
   watch view, so there is no second player and no reload when you switch.
+- **Streams fade in** — a tile shows a spinner over its own background until
+  mpv has a picture, then that scrim crossfades away instead of the video
+  popping in over an empty black card.
 - **Low-latency playback** — streamlink `--player-external-http` re-serves the
   stream as a continuous localhost stream; mpv plays right at the live edge
   (~2.5s, same as the CLI).
@@ -165,8 +168,9 @@ omatv/
 - **Stream won't start** — make sure `streamlink` and `mpv` are installed and
   on your `PATH`. Streams resolve via streamlink; if the channel is offline or
   region-blocked, playback won't start.
-- **Tiles are black** — a tile only has a picture once its stream resolves;
-  give it a beat, and check that the channel is still live.
+- **A tile spins for a while** — the spinner means the stream is still
+  resolving; it gives up after 30 seconds. If a tile stays black, the channel
+  is probably offline or region-blocked.
 - **Chat shows "Read-only"** — your token lacks `chat:edit`. Generate a new
   token with that scope and sign in again.
 - **No follows rail** — your token lacks `user:read:follows`.

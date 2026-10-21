@@ -382,6 +382,20 @@ HOME_CSS = b"""
   font-weight: 700;
   color: #efeff1;
 }
+/* Loading scrim: the SAME colour as .tile, so fading it out reveals the
+   picture instead of fading a dark rectangle over a dark rectangle. Opacity
+   lives on this scrim and never on the GLArea: a GtkGLArea below opacity 1
+   forces an offscreen render path in GSK, which is a cost we will not pay
+   twelve times over on a live grid. */
+.tile-loading {
+  background: #101014;
+  border-radius: 12px;
+}
+.tile-spinner {
+  min-width: 26px;
+  min-height: 26px;
+  color: #a970ff;
+}
 """
 
 MIN_TILE_W = 140
@@ -389,6 +403,13 @@ TILE_TARGET_W = 360
 GRID_MARGIN = 16
 GRID_GAP = 12
 MAX_TILE_COLS = 4
+
+# Grid loading state. A tile shows a spinner over an opaque scrim until mpv
+# has actually produced a first frame, then the scrim crossfades away so the
+# picture arrives instead of popping. The reveal is EVENT driven (mpv pushes
+# the frame size), so a settled grid does no polling at all; this deadline is
+# only the backstop for a stream that never produces a picture.
+LOAD_GIVE_UP_S = 30
 
 
 class GridSurface(Gtk.Fixed):
@@ -523,6 +544,7 @@ class HomePage:
         self._sync_timer = None
         self._sync_deferred = False
         self._reflow_timer = None
+        self._load_timers = {}
         self._install_css()
 
         # Shown (by the window) when nobody is live. Kept here so both files
@@ -988,10 +1010,95 @@ class HomePage:
             if tile is not None:
                 self._stop_tile(tile)
 
+    # ---- first-frame fades (grid) --------------------------------------
+    #
+    # Event-driven, not polled. mpv pushes the stream's frame size the moment a
+    # picture exists (VideoArea._on_video_params), so a settled grid costs
+    # nothing at all and a reveal lands on the frame that actually painted.
+    # The one-shot watchdog exists only for a stream that never produces a
+    # picture, so the scrim cannot spin forever.
+    def _mark_tile_loading(self, tile):
+        """Show the loading scrim on a tile that has no picture yet."""
+        veil = getattr(tile, "load_veil", None)
+        if veil is None or getattr(tile, "loading", False):
+            return
+        tile.loading = True
+        tile.loaded = False
+        tile._load_started = time.monotonic()
+        self.anim.cancel(f"veil-{tile.uid}")
+        veil.set_opacity(1.0)
+        veil.set_visible(True)
+        tile.va.first_frame_cb = lambda t=tile: self._on_tile_first_frame(t)
+        self._load_timers[tile.uid] = GLib.timeout_add_seconds(
+            int(LOAD_GIVE_UP_S), self._load_watchdog, tile
+        )
+
+    def _drop_load_watch(self, tile):
+        """Disarm the first-frame callback and the give-up watchdog."""
+        src = self._load_timers.pop(tile.uid, None)
+        if src is not None:
+            GLib.source_remove(src)
+        va = getattr(tile, "va", None)
+        if va is not None and getattr(va, "first_frame_cb", None) is not None:
+            va.first_frame_cb = None
+
+    def _on_tile_first_frame(self, tile):
+        if getattr(tile, "loading", False):
+            self._reveal_tile(tile)
+
+    def _load_watchdog(self, tile):
+        # This source has fired; drop its id first so _drop_load_watch does not
+        # try to remove a source that is already gone.
+        self._load_timers.pop(tile.uid, None)
+        if getattr(tile, "loading", False):
+            if UI_DEBUG:
+                dbg(f"tile load gave up channel={tile.login} tile={tile.uid}")
+            # A lost notification on a stream that IS painting still deserves
+            # the crossfade; a genuinely dead one just drops its scrim.
+            self._reveal_tile(tile, snap=not tile.va.is_rendering())
+        return False
+
+    def _clear_tile_loading(self, tile):
+        """The tile is not loading anything: no spinner (it is not working)."""
+        tile.loading = False
+        self._drop_load_watch(tile)
+        veil = getattr(tile, "load_veil", None)
+        if veil is not None:
+            self.anim.cancel(f"veil-{tile.uid}")
+            veil.set_visible(False)
+            veil.set_opacity(1.0)
+
+    def _reveal_tile(self, tile, snap=False):
+        """First frame is up: crossfade the scrim away so the video arrives."""
+        tile.loading = False
+        tile.loaded = True
+        self._drop_load_watch(tile)
+        veil = getattr(tile, "load_veil", None)
+        if veil is None:
+            return
+        if snap or not veil.get_visible():
+            self.anim.cancel(f"veil-{tile.uid}")
+            veil.set_visible(False)
+            veil.set_opacity(1.0)
+            return
+        if UI_DEBUG:
+            dbg(
+                f"tile first frame channel={tile.login} tile={tile.uid} "
+                f"after={(time.monotonic() - tile._load_started) * 1000:.0f}ms"
+            )
+        self.anim.fade(
+            f"veil-{tile.uid}", veil, veil.get_opacity(), 0.0,
+            on_done=lambda: veil.set_visible(False),
+            label=f"load in {tile.login}",
+        )
+
     def _start_tile(self, tile):
         if tile.want or tile.va.player is None:
             return
         tile.want = True
+        # A tile that is (re)starting has no picture yet: show the scrim +
+        # spinner until mpv paints its first frame, then crossfade it away.
+        self._mark_tile_loading(tile)
         cmd = [
             "streamlink", "--twitch-low-latency", "twitch.tv/" + tile.login,
             STREAM_QUALITY, "--player-external-http", "--player-external-http-port", "0",
@@ -1029,6 +1136,9 @@ class HomePage:
                 self._mute_tile(tile, tile.va.player)
             elif not url:
                 tile.want = False
+                # Nothing to load: drop the spinner rather than spin forever
+                # over a stream that never resolved.
+                self._clear_tile_loading(tile)
                 GLib.timeout_add(8000, lambda: (self._sync_players(), False)[1])
             return False
 
@@ -1051,6 +1161,9 @@ class HomePage:
             return
         tile.want = False
         self._kill_tile(tile)
+        # A stopped tile is not loading anything: no spinner on it. The next
+        # start re-arms the scrim, so a restart fades in again.
+        self._clear_tile_loading(tile)
         if tile.va.player is not None:
             try:
                 tile.va.player.command("stop")
@@ -1096,6 +1209,10 @@ class HomePage:
 
     def set_tile_watch(self, tile, on):
         tile.watch = bool(on)
+        if tile.watch:
+            # The watch view keeps its own busy pill and must never show the
+            # grid's loading scrim over the full-size player.
+            self._reveal_tile(tile, snap=True)
         # The tile's own overlay (avatar, LIVE badge, name, title, game,
         # viewers) belongs to the GRID. On the watch view that information is
         # already in the top bar and above the chat, so it fades out instead of
@@ -1216,12 +1333,42 @@ class Tile(Gtk.Overlay):
         self._avatar_path = None
         self.cell = None
         self.rect = (0, 0, 0, 0)
+        # Grid loading state, owned by HomePage: loading = scrim is up waiting
+        # for a first frame, loaded = that stream has painted at least once.
+        self.loading = False
+        self.loaded = False
+        self._load_started = 0.0
 
         self.add_css_class("tile")
         self.va = page.VA(page.win, tile=True)
         self.set_child(self.va)
         self.va.connect("realize", self._on_gl_realize)
         self.va.connect("map", lambda *a: page._queue_sync())
+
+        # Loading scrim + spinner, sitting UNDER the chrome so the LIVE badge
+        # and the channel info stay readable while a stream connects. A tile
+        # that has no picture yet shows this instead of an empty black card,
+        # and HomePage crossfades it away on the first real frame. Nothing in
+        # here is interactive, so input must pass straight through to the
+        # tile's own click gesture (can_target False kills the whole subtree,
+        # which is exactly right for a pure decoration).
+        veil = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        veil.add_css_class("tile-loading")
+        veil.set_halign(Gtk.Align.FILL)
+        veil.set_valign(Gtk.Align.FILL)
+        veil.set_hexpand(True)
+        veil.set_vexpand(True)
+        veil.set_can_target(False)
+        self.spinner = Adw.Spinner()
+        self.spinner.add_css_class("tile-spinner")
+        self.spinner.set_halign(Gtk.Align.CENTER)
+        self.spinner.set_valign(Gtk.Align.CENTER)
+        self.spinner.set_hexpand(True)
+        self.spinner.set_vexpand(True)
+        veil.append(self.spinner)
+        veil.set_visible(False)
+        self.load_veil = veil
+        self.add_overlay(veil)
 
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         top.add_css_class("tile-top")
