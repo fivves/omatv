@@ -7,7 +7,6 @@ const viewersEl = $("viewers");
 const connEl = $("conn");
 const noticeEl = $("notice");
 const input = $("msg-input");
-const sendBtn = $("send-btn");
 const emoteBtn = $("emote-btn");
 const emotePop = $("emote-pop");
 const emoteGrid = $("emote-grid");
@@ -1031,14 +1030,12 @@ function updateComposer() {
   if (!readonly) {
     input.contentEditable = "true";
     input.removeAttribute("data-disabled");
-    sendBtn.disabled = false;
     input.dataset.placeholder = "Send a message";
     noticeEl.textContent = "";
     noticeEl.className = "";
   } else {
     input.contentEditable = "false";
     input.setAttribute("data-disabled", "1");
-    sendBtn.disabled = true;
     if (state.connected || state.wantedChannel) {
       noticeEl.textContent =
         "Read-only chat — refresh your twitch.json token (needs chat:edit scope) to send messages";
@@ -1049,6 +1046,11 @@ function updateComposer() {
 
 $("composer").addEventListener("submit", (ev) => {
   ev.preventDefault();
+  // There is no send button any more: Enter is the only way to send, so this
+  // guard is what a disabled button used to enforce. The input is already
+  // contenteditable=false when read-only, but a stray submit must not slip
+  // through either.
+  if (!state.canChat || state.anonMode) return;
   const text = getEditorText().trim();
   if (!text || !state.ws || !state.joinedChannel) return;
 
