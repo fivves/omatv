@@ -16,6 +16,9 @@ latency**.
 - **Home grid** — every followed channel that's live, as a grid of real muted
   160p players. Clicking a tile moves that already-running player into the
   watch view, so there is no second player and no reload when you switch.
+- **Streams fade in** — a tile shows a spinner over its own background until
+  mpv has a picture, then that scrim crossfades away instead of the video
+  popping in over an empty black card.
 - **Low-latency playback** — streamlink `--player-external-http` re-serves the
   stream as a continuous localhost stream; mpv plays right at the live edge
   (~2.5s, same as the CLI).
@@ -32,6 +35,10 @@ latency**.
 - **Watch a pasted link** — `Ctrl+V` on the home grid opens the twitch.tv
   channel in your clipboard, whether or not you follow it. Non-channel Twitch
   URLs (`/videos/`, `/directory`, …) are refused rather than guessed at.
+- **Drag a link or a name in** — drag a twitch.tv link from your browser, or
+  just a channel name from anywhere, onto the window and it opens. A drop works
+  on the watch view too: drop one on a playing stream and it switches to that
+  channel.
 - **Sign in with a paste** — no Twitch dev portal needed; get a token from
   [twitchtokengenerator.com](https://twitchtokengenerator.com/) and paste it in.
 - **Font style** — switch the whole interface, chat included, between the
@@ -104,8 +111,11 @@ completion, Tab completes emotes, and right-clicking a message offers Reply or
 Copy message. The house button at the top of the rail returns to the grid.
 
 To watch something you don't follow, copy its twitch.tv link and press `Ctrl+V`
-on the grid — the channel opens as a guest tile. It's a one-shot: going back home
-forgets it again.
+on the grid, or drag a link onto the window — from a browser, a chat client,
+anywhere. A bare channel name works as a drop too. Dragging works on the watch
+view as well: drop a link on a stream that's playing and it switches to that
+channel. Either way the channel is a guest: it never joins the home grid, and
+going back home lets it go.
 
 ## How it works
 
@@ -158,8 +168,9 @@ omatv/
 - **Stream won't start** — make sure `streamlink` and `mpv` are installed and
   on your `PATH`. Streams resolve via streamlink; if the channel is offline or
   region-blocked, playback won't start.
-- **Tiles are black** — a tile only has a picture once its stream resolves;
-  give it a beat, and check that the channel is still live.
+- **A tile spins for a while** — the spinner means the stream is still
+  resolving; it gives up after 30 seconds. If a tile stays black, the channel
+  is probably offline or region-blocked.
 - **Chat shows "Read-only"** — your token lacks `chat:edit`. Generate a new
   token with that scope and sign in again.
 - **No follows rail** — your token lacks `user:read:follows`.
