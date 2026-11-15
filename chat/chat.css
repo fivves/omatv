@@ -135,7 +135,10 @@ body {
   overflow-y: auto;
   overflow-x: hidden;
   padding: 10px 14px;
-  scroll-behavior: smooth;
+  /* Instant, not smooth: every incoming message writes scrollTop, and a scroll
+     ANIMATION restarted 30x a second never finishes, so the transcript visibly
+     creeps and stutters behind the messages. Browsers use instant here too. */
+  scroll-behavior: auto;
 }
 
 #msgs::-webkit-scrollbar { width: 6px; }
@@ -176,6 +179,10 @@ body {
   from { opacity: 0; transform: translateY(3px); }
   to { opacity: 1; transform: none; }
 }
+
+/* Rows that arrive in a burst (see MSG_ANIM_GAP in chat.js) skip the fade.
+   With several rows always mid-fade the transcript read as flickering. */
+.msg.no-anim { animation: none; }
 
 .msg.mentioned {
   background: rgba(169,112,255,.16);
@@ -230,8 +237,12 @@ body {
   vertical-align: middle;
   margin: -4px 1px -6px;
   transition: transform .12s ease;
+  transform-origin: center center;
 }
-.emote:hover { transform: scale(1.6); }
+/* The enlarged emote has to paint OVER the rows that follow it. Without a
+   z-index the next message's text is painted on top of it, which is the
+   "hover enlarge gets cut off / only works sometimes" report. */
+.emote:hover { transform: scale(1.6); position: relative; z-index: 3; }
 
 .emote-stack { display: inline-block; position: relative; vertical-align: middle; }
 .emote-stack .emote { margin: -10px -12px -14px; }
@@ -264,6 +275,35 @@ a.link:hover { text-decoration: underline; }
   cursor: pointer;
   z-index: 5;
 }
+
+/* Zoom pill: only visible while the chat is not at 100%. It is a child of the
+   composer (which is position:relative), anchored to its top edge so it rides
+   above the input however tall the composer grows (reply bar, notice). */
+#zoom-reset {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  right: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--panel-2);
+  color: var(--muted);
+  border: 1px solid rgba(255,255,255,.08);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  padding: 5px 9px 5px 8px;
+  border-radius: 999px;
+  cursor: pointer;
+  z-index: 5;
+  box-shadow: 0 2px 10px rgba(0,0,0,.4);
+  transition: color .12s ease, background .12s ease, border-color .12s ease;
+}
+#zoom-reset:hover { color: var(--text); background: #26262e; border-color: rgba(255,255,255,.16); }
+#zoom-reset:active { transform: translateY(1px); }
+#zoom-reset .zoom-glyph { font-size: 12px; }
 
 #composer {
   flex-shrink: 0;
@@ -361,7 +401,7 @@ a.link:hover { text-decoration: underline; }
   vertical-align: middle;
   margin: 0 1px;
 }
-#msg-input .emote:hover { transform: scale(1.3); }
+#msg-input .emote:hover { transform: scale(1.3); position: relative; z-index: 3; }
 
 #emote-btn {
   background: var(--panel-2);

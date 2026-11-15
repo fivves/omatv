@@ -36,10 +36,24 @@ let state = {
   myBadges: "", // our own badges (e.g. "subscriber/6,premium/1") from USERSTATE
   mySetEmotes: [],
   knownUsers: new Map(),  // login(lower) -> {login, display, color}
+  nativeById: new Map(),  // native Twitch emote id -> name (for alt text / copy)
+  // Scrollback: every rendered message keeps a descriptor here so the DOM can
+  // stay small (a zoom step relayouts every row, see DOM_ROWS_MAX) while the
+  // transcript above the window is rebuilt on demand when scrolling up.
+  buffer: [],
+  domStart: 0, // index in buffer of the first row currently in the DOM
   stick: true,
   reconnectTimer: null,
   reply: null, // {id, login, display, body} while composing a reply
 };
+
+// Chat zoom state lives up here, next to the other state, because an "init"
+// push can reach applyChatZoom() before the zoom section below has evaluated
+// its declarations (a `let` in the temporal dead zone throws).
+const ZOOM_LADDER = [0.7, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5];
+const ZOOM_WHEEL_GAP = 110; // ms between wheel steps, so a fast spin can't skip the ladder
+let zoomFactor = 1;
+let zoomSteppedAt = 0;
 
 function bridge(msg) {
   try {
@@ -59,6 +73,7 @@ window.__push = function (payload) {
       state.nick = payload.nick || null;
       state.canChat = !!payload.can_chat && !!payload.token;
       state.myLoginLower = (payload.nick || "").toLowerCase();
+      applyChatZoom(payload.zoom, false);
       updateConnUI();
       updateComposer();
       if (state.wantedChannel) joinChannel(state.wantedChannel);
@@ -193,6 +208,8 @@ async function loadEmotes(channelId) {
           url,
           zeroWidth: !!(e.data.flags & 1),
           provider: "7TV",
+          w: e.data.width,
+          h: e.data.height,
         });
     });
 
@@ -214,6 +231,8 @@ async function loadEmotes(channelId) {
           map.set(e.name, {
             url: u.startsWith("//") ? "https:" + u : u,
             provider: "FFZ",
+            w: e.width,
+            h: e.height,
           });
       })
     );
@@ -232,6 +251,16 @@ async function loadEmotes(channelId) {
   });
   (state.mySetEmotes || []).forEach((e) => {
     if (e?.name && e?.url) map.set(e.name, { url: e.url, provider: "Twitch" });
+  });
+
+  // IRC tags carry Twitch emotes as IDs only, so a message's native emote has no
+  // name of its own. This index is what lets the rendered <img> carry the real
+  // name (as alt text) — which is exactly what Ctrl+C copies and what makes the
+  // emote pasteable back into the composer.
+  state.nativeById = new Map();
+  [...map.entries()].forEach(([name, e]) => {
+    const m = /\/emoticons\/v2\/(\d+)\//.exec(e.url || "");
+    if (m) state.nativeById.set(m[1], name);
   });
 
   state.customEmotes = map;
@@ -253,8 +282,11 @@ async function loadMyEmoteSets(setIds) {
   }
   // merge into the current map without waiting for a channel reload
   (state.mySetEmotes || []).forEach((e) => {
-    if (e?.name && e?.url)
+    if (e?.name && e?.url) {
       state.customEmotes.set(e.name, { url: e.url, provider: "Twitch" });
+      const m = /\/emoticons\/v2\/(\d+)\//.exec(e.url);
+      if (m) state.nativeById.set(m[1], e.name);
+    }
   });
   state.allEmoteList = [...state.customEmotes.entries()].sort((a, b) =>
     a[0].localeCompare(b[0])
@@ -568,11 +600,52 @@ function userColor(tags, nick) {
   return FALLBACK_COLORS[h % FALLBACK_COLORS.length];
 }
 
+// Reserve the image's box BEFORE it decodes. An <img> with no reserved width is
+// a zero-width box until its bytes land, and then the line re-wraps around it.
+// Measured on this page with cold CDN emote images: 3.5px of transcript growth
+// per message unreserved, 0px with the aspect ratio reserved — that growth is
+// the "text jumps/blinks after it spawns" complaint.
+function sizeEmoteBox(img, emote) {
+  const w = Number(emote?.w) || 0;
+  const h = Number(emote?.h) || 0;
+  if (w > 0 && h > 0) {
+    img.style.aspectRatio = w + " / " + h;
+    return;
+  }
+  // BTTV ships no dimensions, so start square (nearly all emotes are) and
+  // correct once on load only if the real shape is far from square.
+  img.style.aspectRatio = "1 / 1";
+  img.addEventListener(
+    "load",
+    () => {
+      const nw = img.naturalWidth;
+      const nh = img.naturalHeight;
+      if (nw > 0 && nh > 0 && Math.abs(nw / nh - 1) > 0.08)
+        img.style.aspectRatio = nw + " / " + nh;
+    },
+    { once: true }
+  );
+}
+
+// Transcript window. A page-zoom step relayouts EVERY row in the DOM: measured
+// on this page, 500 rows costs up to 106ms per step (a visible hitch while
+// zooming), 250 rows ~31ms, 150 rows ~15ms (smooth). Rows above the window stay
+// in state.buffer and are rebuilt on demand, so scrollback reaches FURTHER back
+// than the old 500-row DOM cap, not less.
+const DOM_ROWS_MAX = 150;
+const DOM_ROWS_REFILL = 60; // rows rebuilt when you scroll up near the top
+const BUFFER_MAX = 2000; // how far back scrollback goes
+// Consecutive messages closer together than this skip the entry animation: at
+// Twitch message rates a 150ms fade on every row means several rows are always
+// mid-fade, which reads as the chat flickering. Single messages still fade.
+const MSG_ANIM_GAP = 220;
+
 function makeEmoteImg(emote) {
   const img = document.createElement("img");
   img.className = "emote";
   img.src = emote.url;
   img.alt = img.title = emote._name || "";
+  sizeEmoteBox(img, emote);
   return img;
 }
 
@@ -615,6 +688,16 @@ function addMessage(nick, tags, rawText) {
     if (_pendingMsgs.length > 200) _pendingMsgs.shift();
     return;
   }
+  const row = buildMessageRow(nick, tags, rawText);
+  if (!row) return;
+  // The descriptor is what lets the row be rebuilt after it scrolls out of the
+  // DOM window (and back in when you scroll up).
+  state.buffer.push({ kind: "msg", nick, tags, text: rawText });
+  trimBufferFront();
+  appendMsg(row);
+}
+
+function buildMessageRow(nick, tags, rawText) {
   let text = rawText;
   let isAction = false;
   if (text.startsWith("\u0001ACTION ")) {
@@ -716,7 +799,7 @@ function addMessage(nick, tags, rawText) {
     if (r.end >= cps.length) continue;
     cps.splice(r.start, r.end - r.start + 1, {
       native: `https://static-cdn.jtvnw.net/emoticons/v2/${r.id}/default/dark/2.0`,
-      name: text,
+      id: r.id,
     });
   }
 
@@ -734,7 +817,17 @@ function addMessage(nick, tags, rawText) {
       const img = document.createElement("img");
       img.className = "emote";
       img.src = piece.native;
-      img.title = "(Twitch emote)";
+      img.style.aspectRatio = "1 / 1"; // Twitch's own emotes are square: reserve it
+      const name = state.nativeById.get(piece.id) || "";
+      if (name) {
+        // alt is what Ctrl+C hands to the clipboard (and what makes the emote
+        // pasteable back into the composer), title is the hover hint.
+        img.alt = name;
+        img.title = name + " · Twitch";
+        img.dataset.name = name;
+      } else {
+        img.title = "Twitch emote";
+      }
       frag.append(img);
     } else {
       buf += piece;
@@ -743,8 +836,7 @@ function addMessage(nick, tags, rawText) {
   flushBuf();
 
   row.append(frag);
-
-  appendMsg(row);
+  return row;
 }
 
 function addSystem(text, kind) {
@@ -753,13 +845,48 @@ function addSystem(text, kind) {
   row.textContent = text;
   if (kind === "err") row.style.color = "var(--red)";
   if (kind === "sub") row.classList.add("highlighted");
+  state.buffer.push({ kind: "sys", text, cls: kind || "" });
+  trimBufferFront();
   appendMsg(row);
 }
 
+// Keep the descriptor buffer bounded. Trimming from the front shifts every DOM
+// row's index, so domStart moves with it — and if the oldest row in the DOM is
+// itself falling out of the buffer, it has to go too or the mapping desyncs.
+function trimBufferFront() {
+  while (state.buffer.length > BUFFER_MAX && msgsEl.children.length > 1) {
+    if (state.domStart === 0) msgsEl.firstElementChild.remove();
+    state.buffer.shift();
+    if (state.domStart > 0) state.domStart--;
+  }
+}
+
+// Rebuild one row from its descriptor (used when scrolling back into history).
+function rebuildRow(desc) {
+  if (!desc) return null;
+  if (desc.kind === "sys") {
+    const row = document.createElement("div");
+    row.className = "msg system-msg no-anim";
+    row.textContent = desc.text;
+    if (desc.cls === "err") row.style.color = "var(--red)";
+    if (desc.cls === "sub") row.classList.add("highlighted");
+    return row;
+  }
+  const row = buildMessageRow(desc.nick, desc.tags, desc.text);
+  if (row) row.classList.add("no-anim");
+  return row;
+}
+
+let lastAppendAt = 0;
+
 function appendMsg(row) {
   const atBottom = isNearBottom();
+  // Burst suppression: only a message that arrives on its own animates in.
+  const now = performance.now();
+  if (now - lastAppendAt < MSG_ANIM_GAP) row.classList.add("no-anim");
+  lastAppendAt = now;
   msgsEl.append(row);
-  trimOld();
+  trimTranscript();
   if (atBottom || state.stick) {
     requestAnimationFrame(scrollToBottom);
   } else {
@@ -779,8 +906,42 @@ function scrollToBottom() {
   resumeBtn.classList.add("hidden");
 }
 
-function trimOld() {
-  while (msgsEl.children.length > 500) msgsEl.firstElementChild.remove();
+// Keep the DOM window small (see DOM_ROWS_MAX). While stuck to the bottom the
+// window is tight; while someone is reading history it is allowed to grow and
+// any trim preserves their reading position instead of jumping the text.
+function trimTranscript() {
+  const cap = state.stick ? DOM_ROWS_MAX : DOM_ROWS_MAX * 2;
+  if (msgsEl.children.length <= cap) return;
+  const prevHeight = msgsEl.scrollHeight;
+  const prevTop = msgsEl.scrollTop;
+  let removed = 0;
+  while (msgsEl.children.length > cap && state.domStart < state.buffer.length - 1) {
+    msgsEl.firstElementChild.remove();
+    state.domStart++;
+    removed++;
+  }
+  if (!state.stick && removed)
+    msgsEl.scrollTop = Math.max(0, prevTop - (prevHeight - msgsEl.scrollHeight));
+}
+
+// Scrollback: rebuild older rows from the buffer when the top of the window is
+// reached, then restore the scroll position so the text under the cursor does
+// not move (that anchoring is the whole trick of a virtualised transcript).
+function prependOlder(count) {
+  if (state.domStart <= 0) return false;
+  const take = Math.min(count, state.domStart);
+  const from = state.domStart - take;
+  const frag = document.createDocumentFragment();
+  for (let i = from; i < state.domStart; i++) {
+    const el = rebuildRow(state.buffer[i]);
+    if (el) frag.append(el);
+  }
+  const prevHeight = msgsEl.scrollHeight;
+  const prevTop = msgsEl.scrollTop;
+  msgsEl.insertBefore(frag, msgsEl.firstChild);
+  state.domStart = from;
+  msgsEl.scrollTop = prevTop + (msgsEl.scrollHeight - prevHeight);
+  return true;
 }
 
 msgsEl.addEventListener("scroll", () => {
@@ -790,6 +951,8 @@ msgsEl.addEventListener("scroll", () => {
   } else if (msgsEl.scrollHeight - msgsEl.scrollTop - msgsEl.clientHeight > 120) {
     state.stick = false;
   }
+  // Near the top of what is rendered? Pull the next chunk of history in.
+  if (state.domStart > 0 && msgsEl.scrollTop < 320) prependOlder(DOM_ROWS_REFILL);
 });
 resumeBtn.addEventListener("click", scrollToBottom);
 
@@ -912,6 +1075,68 @@ document.addEventListener("keydown", (ev) => {
     input.focus();
   }
 });
+
+/* ---------------------------- chat zoom ------------------------------ */
+// Ctrl+wheel over the chat sizes the text the way a browser does. WebKit's own
+// page zoom does the scaling (main.py: set_chat_zoom), so the transcript
+// REFLOWS at the new size instead of being stretched, and every hit-test in
+// here keeps matching what the user sees. This end only decides the step and
+// keeps the reset pill in step with what Python applied.
+//
+// Reflect a zoom value (`persist` sends it to Python, which applies the page
+// zoom and writes settings.json; the restored value arrives via "init" and is
+// reflected without echoing it straight back. The two nodes are looked up per
+// call (cheap) so an early "init" replayed by __pushQueue cannot hit the
+// temporal dead zone of a top-level const.
+function applyChatZoom(z, persist) {
+  const next = Number(z);
+  zoomFactor = Number.isFinite(next) && next > 0 ? next : 1;
+  const atDefault = Math.abs(zoomFactor - 1) < 0.001;
+  const btn = document.getElementById("zoom-reset");
+  const pct = document.getElementById("zoom-pct");
+  if (btn) btn.classList.toggle("hidden", atDefault);
+  if (pct && !atDefault) pct.textContent = Math.round(zoomFactor * 100) + "%";
+  if (persist) bridge({ action: "chat_zoom", value: zoomFactor });
+}
+
+function stepChatZoom(dir) {
+  let i = ZOOM_LADDER.findIndex((v) => v >= zoomFactor - 0.001);
+  if (i < 0) i = ZOOM_LADDER.indexOf(1);
+  i = Math.max(0, Math.min(ZOOM_LADDER.length - 1, i + dir));
+  if (ZOOM_LADDER[i] !== zoomFactor) applyChatZoom(ZOOM_LADDER[i], true);
+}
+
+// passive:false because the page must not also scroll while zooming.
+window.addEventListener(
+  "wheel",
+  (ev) => {
+    if (!ev.ctrlKey) return;
+    ev.preventDefault();
+    const now = performance.now();
+    if (now - zoomSteppedAt < ZOOM_WHEEL_GAP) return;
+    zoomSteppedAt = now;
+    stepChatZoom(ev.deltaY > 0 ? -1 : 1);
+  },
+  { passive: false }
+);
+
+// Ctrl+0 / Ctrl+= / Ctrl+- , the browser shortcuts. Ctrl needs no shift for
+// +/- here: both the keypad and the main-row keys report "+"/"=".
+document.addEventListener("keydown", (ev) => {
+  if (!ev.ctrlKey || ev.altKey || ev.metaKey) return;
+  if (ev.key === "0") {
+    ev.preventDefault();
+    applyChatZoom(1, true);
+  } else if (ev.key === "+" || ev.key === "=") {
+    ev.preventDefault();
+    stepChatZoom(1);
+  } else if (ev.key === "-") {
+    ev.preventDefault();
+    stepChatZoom(-1);
+  }
+});
+
+document.getElementById("zoom-reset").addEventListener("click", () => applyChatZoom(1, true));
 
 /* ------------------------------ composer ----------------------------- */
 
@@ -1367,10 +1592,32 @@ function setCaretTextOffset(target) {
 
 // Render emote words in the contenteditable as <img>. Preserves caret by
 // snapshotting the caret offset, rebuilding, and restoring.
-// A word only becomes an emote image once it's COMPLETE: the caret must be
-// past the end of the token (i.e. the user typed a space / moved on). If the
-// caret is inside or at the end of the token, it's still being typed — keep
-// it as text so "Kapp" doesn't flash to an image while typing "Kappa".
+//
+// Pasting goes in as plain text, and a pasted emote NAME becomes the emote
+// immediately. Copying a native Twitch emote out of the transcript yields its
+// name (that is what the img alt text is for, see buildMessageRow), so pasting
+// it back should round-trip the same way a BTTV/7TV name always did.
+let pasteForceToken = null;
+
+input.addEventListener("paste", (ev) => {
+  const clip = ev.clipboardData;
+  const text = clip ? clip.getData("text/plain") : "";
+  ev.preventDefault();
+  if (!text) return;
+  const clean = text.replace(/\r\n?/g, "\n");
+  insertEditorText(clean);
+  const word = clean.trim();
+  if (word && !/\s/.test(word) && state.customEmotes.has(word)) {
+    pasteForceToken = word;
+    renderEmotesInEditor();
+    pasteForceToken = null;
+  }
+});
+
+// A word becomes an image once the caret is past the end of the token (i.e. the
+// user typed a space / moved on). If the caret is inside or at the end of the
+// token, it's still being typed — keep it as text so "Kapp" doesn't flash to an
+// image while typing "Kappa".
 function renderEmotesInEditor() {
   const caret = getCaretTextOffset();
   const virtual = caret ? caret.virtual : getEditorText();
@@ -1395,7 +1642,9 @@ function renderEmotesInEditor() {
     }
 
     const beingTyped = caretOffset > start && caretOffset <= end;
-    const e = !beingTyped ? state.customEmotes.get(tok) : null;
+    // A pasted emote name converts even though the caret sits on it.
+    const forced = pasteForceToken !== null && tok === pasteForceToken;
+    const e = !beingTyped || forced ? state.customEmotes.get(tok) : null;
     if (e) {
       const img = document.createElement("img");
       img.className = "emote";
@@ -1403,6 +1652,7 @@ function renderEmotesInEditor() {
       img.alt = tok;
       img.dataset.name = tok;
       img.title = `${tok} · ${e.provider}`;
+      sizeEmoteBox(img, e);
       frag.append(img);
     } else {
       frag.append(document.createTextNode(tok));
@@ -1641,6 +1891,8 @@ async function joinChannel(info) {
   cancelReply();
   chanNameEl.textContent = info.name || info.login;
   msgsEl.innerHTML = "";
+  state.buffer = [];
+  state.domStart = 0;
   _pendingMsgs = [];
   state.emotesReady = false;
   _emoteLoadBits = 0;

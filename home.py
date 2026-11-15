@@ -538,6 +538,8 @@ class HomePage:
         # kept alive for re-use. See park_guest(): destroying the widget that was
         # just the full-size watch video blanks the whole window.
         self.parked = None
+        # Evicted grid tiles are parked here, NOT destroyed. See _park_tile().
+        self.spare = []
         self.anim = Anim(self, surface)
         self._active = False
         self.mode = "home"
@@ -585,11 +587,12 @@ class HomePage:
             seen.add(cid)
             tile = self.tiles.get(cid)
             if tile is None:
-                tile = Tile(self, info)
+                tile = self._new_tile(info)
                 tile.set_opacity(0.0)
                 self.tiles[cid] = tile
                 self.order.append(cid)
-                self.surface.put(tile, 0, 0)
+                if tile.get_parent() is None:
+                    self.surface.put(tile, 0, 0)
                 new_tiles.append(tile)
                 dbg(
                     f"grid membership add channel={info['login']} cid={cid} "
@@ -654,13 +657,14 @@ class HomePage:
                 self.order.append(cid)
                 self.guest.add(cid)
             return tile
-        tile = Tile(self, info)
+        tile = self._new_tile(info)
         tile.set_opacity(0.0)
         self.tiles[cid] = tile
         self.order.append(cid)
         self.pinned.add(cid)
         self.guest.add(cid)
-        self.surface.put(tile, 0, 0)
+        if tile.get_parent() is None:
+            self.surface.put(tile, 0, 0)
         dbg(
             f"grid guest add channel={info.get('login')} cid={cid} "
             f"tile={tile.uid} player={tile.va.pid}"
@@ -702,7 +706,11 @@ class HomePage:
         self.anim.cancel(f"arr-{tile.uid}")
         self._stop_tile(tile)
         if tile.get_parent() is not None:
-            self.surface.remove(tile)
+            if tile.get_visible():
+                # On screen: destroying it would blank the window. Park it.
+                self._park_tile(tile, why="guest")
+            else:
+                self.surface.remove(tile)
         print(f"[omatv][guest] remove cid={cid} tile={tile.uid}", flush=True)
         if self.parked == cid:
             self.parked = None
@@ -739,6 +747,44 @@ class HomePage:
               flush=True)
         self._set_count(len(self.grid_cids()))
         self.win.set_home_empty(not self.grid_cids())
+        return tile
+
+    def _new_tile(self, info):
+        """Return a tile widget for `info`, re-using a parked one if possible.
+
+        A parked tile is still parented to the surface and still owns a GLArea
+        and an mpv player, so re-targeting it costs nothing and destroys
+        nothing. Returns a widget that may or may not already be parented:
+        callers must check `tile.get_parent() is None` before Gtk.Fixed.put.
+        """
+        if not self.spare:
+            return Tile(self, info)
+        tile = self.spare.pop()
+        # Purge any registry entry that still points at this widget from its
+        # previous life. Without this, evicting the old cid parks the widget
+        # that is now a different channel's live tile, which hands that live
+        # player to the pool and hides a channel nobody asked to hide.
+        for key, val in list(self.tiles.items()):
+            if val is tile:
+                self.tiles.pop(key, None)
+                if key in self.order:
+                    self.order.remove(key)
+                self.pinned.discard(key)
+                self.guest.discard(key)
+        tile.cid = info["id"]
+        tile.login = info["login"]
+        tile.name = info.get("name") or info["login"]
+        tile.info = dict(info)
+        tile.cell = None
+        tile.watch = False
+        tile.update_info(info)
+        tile.set_opacity(0.0)
+        tile.set_visible(True)
+        print(
+            f"[omatv][spare] reuse tile={tile.uid} channel={tile.login} "
+            f"pool={len(self.spare)}",
+            flush=True,
+        )
         return tile
 
     def _reclaim_parked(self, info):
@@ -899,10 +945,42 @@ class HomePage:
         )
 
     def _drop_tile(self, tile):
+        """Evict a grid tile WITHOUT destroying its widget.
+
+        This used to call surface.remove(tile). Removing a realized GLArea
+        unrealizes it, and VideoArea.on_unrealize() frees the mpv render
+        context; the flaw is that this ran on the GL context GSK paints the
+        whole window with, so the header, grid and chat all went black while
+        the process kept running (no core, no traceback, window still mapped).
+        The 60s follows refresh evicts tiles by itself, which is why the window
+        went black "after a while" with nobody touching it. Measured the same
+        signature twice on the guest path before this.
+
+        So: stop it, hide it, keep the widget. _new_tile() re-uses it.
+        """
         self._stop_tile(tile)
         if tile.get_parent() is not None:
-            self.surface.remove(tile)
-            dbg(f"grid tile dropped channel={tile.login} tile={tile.uid}")
+            self._park_tile(tile, why="evict")
+
+    def _park_tile(self, tile, why=""):
+        # Never park a widget that is still registered as a live channel: that
+        # would hide a stream the grid believes is on screen.
+        for key, val in self.tiles.items():
+            if val is tile and key != getattr(tile, "cid", None):
+                print(
+                    f"[omatv][spare] skip park tile={tile.uid}: still live as "
+                    f"cid={key}",
+                    flush=True,
+                )
+                return
+        tile.set_visible(False)
+        tile.set_opacity(0.0)
+        self.spare.append(tile)
+        print(
+            f"[omatv][spare] park tile={tile.uid} channel={tile.login} "
+            f"why={why} pool={len(self.spare)}",
+            flush=True,
+        )
 
     def tile_rects(self):
         return {cid: tuple(self.tiles[cid].cell or (0, 0, 0, 0)) for cid in self.order}

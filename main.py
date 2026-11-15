@@ -49,6 +49,11 @@ EMOTE_TTL_S = 6 * 3600
 EMOTE_HOSTS = ("betterttv.net", "frankerfacez.com", "7tv.io")
 SETTINGS_PATH = os.path.expanduser("~/.config/omatv/settings.json")
 DEFAULT_CHAT_WIDTH = 340
+# Chat page zoom. Ctrl+wheel in the chat walks this ladder in chat.js; these
+# bounds are the backstop (and clamp a hand-edited settings.json).
+CHAT_ZOOM_MIN = 0.7
+CHAT_ZOOM_MAX = 2.5
+CHAT_ZOOM_DEFAULT = 1.0
 
 # The chat page owns its own palette (chat.css :root). Its background follows
 # the GTK theme instead of being hardcoded: this file is the palette the running
@@ -907,11 +912,32 @@ class VideoArea(Gtk.GLArea):
     def is_muted(self):
         return bool(self.player and self.player.mute)
 
+    def _free_render_ctx(self):
+        """Free the mpv render context with the GL context CURRENT.
+
+        mpv's render API requires the GL context that created the context to be
+        current when it is freed. GTK emits "unrealize" with no context
+        current, and freeing anyway leaves GL objects and driver state behind
+        on the context GSK paints the whole window with: every surface goes
+        black while the process keeps running. So make it current first, and
+        never let a dead context raise out of a destroy handler.
+        """
+        ctx = self.render_ctx
+        if ctx is None:
+            return
+        self.render_ctx = None
+        ctx.update_cb = None
+        try:
+            self.make_current()
+        except Exception:
+            pass
+        try:
+            ctx.free()
+        except Exception as exc:
+            print(f"[omatv][gl] render_ctx.free failed: {exc}", flush=True)
+
     def on_unrealize(self, *a):
-        if self.render_ctx:
-            self.render_ctx.update_cb = None
-            self.render_ctx.free()
-            self.render_ctx = None
+        self._free_render_ctx()
         if self.player:
             try:
                 self.player.terminate()
@@ -920,10 +946,7 @@ class VideoArea(Gtk.GLArea):
             self.player = None
 
     def shutdown(self):
-        if self.render_ctx:
-            self.render_ctx.update_cb = None
-            self.render_ctx.free()
-            self.render_ctx = None
+        self._free_render_ctx()
         if self.player:
             try:
                 self.player.terminate()
@@ -953,6 +976,17 @@ class OmatvWindow(Adw.ApplicationWindow):
         # toggle's active state reads it). Applied as a class once the CSS
         # provider exists, below.
         self.font_mono = bool(load_settings().get("font_mono", False))
+
+        # Chat page zoom, restored from settings.json before the WebView exists
+        # (build_chat_view applies it, so the first paint is already at the
+        # remembered size). Scaling is WebKit's own page zoom, not a CSS
+        # transform: it reflows the transcript and keeps the chat's hit-testing
+        # honest at any size.
+        try:
+            self.chat_zoom = float(load_settings().get("chat_zoom", CHAT_ZOOM_DEFAULT))
+        except (TypeError, ValueError):
+            self.chat_zoom = CHAT_ZOOM_DEFAULT
+        self.chat_zoom = max(CHAT_ZOOM_MIN, min(CHAT_ZOOM_MAX, self.chat_zoom))
 
         self.toast_overlay = Adw.ToastOverlay()
 
@@ -1762,6 +1796,30 @@ class OmatvWindow(Adw.ApplicationWindow):
             "--panel-2": lift_hex(base, CHAT_PANEL_LIFT[1]),
         }
 
+    def set_chat_zoom(self, value):
+        """Apply and persist the chat's page zoom (ctrl+wheel in the chat).
+
+        WebKit's zoom_level, not a CSS zoom transform: zoom_level is a real
+        page zoom, so the transcript REFLOWS at the new size (like Ctrl+wheel
+        in a browser) instead of being stretched, and the chat's own hit-testing
+        (context menu at client coords, reply, drag) stays correct, which a CSS
+        zoom would break because getBoundingClientRect would no longer match
+        what the user sees.
+        """
+        try:
+            zoom = float(value)
+        except (TypeError, ValueError):
+            return
+        zoom = max(CHAT_ZOOM_MIN, min(CHAT_ZOOM_MAX, zoom))
+        if abs(zoom - self.chat_zoom) < 0.001:
+            return
+        self.chat_zoom = zoom
+        self.webview.set_zoom_level(zoom)
+        settings = load_settings()
+        settings["chat_zoom"] = zoom
+        save_settings(settings)
+        print(f"chat zoom: {zoom:.2f}", flush=True)
+
     def set_font_mono(self, mono):
         """Switch the whole app between the UI font and a monospace one.
 
@@ -1893,6 +1951,9 @@ class OmatvWindow(Adw.ApplicationWindow):
             user_content_manager=manager,
             network_session=self.network_session,
         )
+        # Restore the remembered chat size before the page loads, so the first
+        # paint is already correct (chat.js keeps the reset pill in step).
+        wv.set_zoom_level(self.chat_zoom)
         # The chat page owns right-click: it shows its own reply/copy menu.
         # Returning True marks the event handled so WebKit doesn't also pop
         # its default "Back / Reload / Inspect Element" menu on top of it.
@@ -1957,6 +2018,7 @@ class OmatvWindow(Adw.ApplicationWindow):
                     "token": self.api.token,
                     "nick": self.api.login,
                     "can_chat": self.api.can_chat,
+                    "zoom": self.chat_zoom,
                 }
             )
             for item in backlog:
@@ -2036,6 +2098,9 @@ class OmatvWindow(Adw.ApplicationWindow):
 
         elif action == "notify":
             self.show_toast(msg.get("text", ""))
+
+        elif action == "chat_zoom":
+            self.set_chat_zoom(msg.get("value", CHAT_ZOOM_DEFAULT))
 
     def fetch_twitch_emotes(self, broadcaster_id):
         """Fetch global + channel + the viewer's own-channel emotes via Helix,
