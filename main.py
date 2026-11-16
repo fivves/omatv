@@ -1239,12 +1239,9 @@ class OmatvWindow(Adw.ApplicationWindow):
         # to block a click that belongs to the grid.
         self.empty_revealer.set_can_target(False)
 
-        # scroll + click over the watch video
-        scroll = Gtk.EventControllerScroll(
-            flags=Gtk.EventControllerScrollFlags.BOTH_AXES
-        )
-        scroll.connect("scroll", self.on_video_scroll)
-        self.watch_chrome.add_controller(scroll)
+        # click over the watch video. The wheel is deliberately unhandled:
+        # scroll-to-volume was removed, so scrolling over the player does
+        # nothing at all rather than silently changing the volume.
         self._click_timer = None
         click = Gtk.GestureClick(button=0)
         click.connect("released", self.on_video_click)
@@ -2243,22 +2240,6 @@ class OmatvWindow(Adw.ApplicationWindow):
         if tile is None or tile.va is None or tile.va.player is None:
             return None
         return tile.va.player
-
-    def on_video_scroll(self, ctrl, dx, dy):
-        player = self.watch_player()
-        if player is None:
-            return False
-        try:
-            vol = float(player.volume)
-        except Exception:
-            return False
-        new_vol = vol - 5 if (dy + dx) > 0 else vol + 5
-        try:
-            player.volume = max(0, min(130, new_vol))
-        except Exception:
-            return False
-        self.flash_status(f"Volume {int(new_vol)}%", transient=True)
-        return True
 
     def on_video_click(self, gesture, n, x, y):
         b = gesture.get_current_button()
